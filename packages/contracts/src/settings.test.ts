@@ -236,6 +236,15 @@ describe("custom model settings", () => {
   });
 });
 
+describe("ClaudeSettings shadow home", () => {
+  it("decodes shadowHomePath with an empty default", () => {
+    expect(decodeClaudeSettings({}).shadowHomePath).toBe("");
+    expect(decodeClaudeSettings({ shadowHomePath: "  ~/.claude-t3/work  " }).shadowHomePath).toBe(
+      "~/.claude-t3/work",
+    );
+  });
+});
+
 describe("ClaudeSettings auto-compaction", () => {
   it("uses Claude's default threshold when no override is configured", () => {
     expect(decodeClaudeSettings({}).autoCompactWindow).toBe("");
