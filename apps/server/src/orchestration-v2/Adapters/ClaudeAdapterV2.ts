@@ -113,6 +113,10 @@ import {
   makeClaudeEnvironment,
 } from "../../provider/Drivers/ClaudeHome.ts";
 import {
+  materializeClaudeShadowHome,
+  resolveClaudeHomeLayout,
+} from "../../provider/Drivers/ClaudeHomeLayout.ts";
+import {
   BUNDLED_CLAUDE_MODEL_CATALOG,
   resolveClaudeCatalogContextWindowTokens,
   type ClaudeModelCatalog,
@@ -445,6 +449,7 @@ export interface ClaudeAgentSdkSubagentLookupInput {
 }
 
 const isClaudeAgentSdkQueryRunnerError = Schema.is(ClaudeAgentSdkQueryRunnerError);
+const isProviderAdapterDriverCreateError = Schema.is(ProviderAdapterDriverCreateError);
 const isProviderAdapterRuntimeRequestResponseError = Schema.is(
   ProviderAdapter.ProviderAdapterRuntimeRequestResponseError,
 );
@@ -9222,6 +9227,18 @@ export const createClaudeAdapterV2 = Effect.fn("ClaudeAdapterV2Driver.create")(
     const serverConfig = yield* ServerConfig.ServerConfig;
     const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
     const baseEnvironment = yield* mergeProviderInstanceEnvironment(environment, hostEnvironment);
+    yield* resolveClaudeHomeLayout(config, baseEnvironment).pipe(
+      Effect.flatMap(materializeClaudeShadowHome),
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterDriverCreateError({
+            driver: CLAUDE_PROVIDER,
+            instanceId,
+            detail: cause.message,
+            cause,
+          }),
+      ),
+    );
     const claudeEnvironment = yield* makeClaudeEnvironment(config, baseEnvironment);
     const path = yield* Path.Path;
     const crypto = yield* Crypto.Crypto;
@@ -9245,14 +9262,15 @@ export const createClaudeAdapterV2 = Effect.fn("ClaudeAdapterV2Driver.create")(
   },
   (effect, input, _hooks) =>
     effect.pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderAdapterDriverCreateError({
-            driver: CLAUDE_PROVIDER,
-            instanceId: input.instanceId,
-            detail: "Failed to create Claude Agent SDK adapter.",
-            cause,
-          }),
+      Effect.mapError((cause) =>
+        isProviderAdapterDriverCreateError(cause)
+          ? cause
+          : new ProviderAdapterDriverCreateError({
+              driver: CLAUDE_PROVIDER,
+              instanceId: input.instanceId,
+              detail: "Failed to create Claude Agent SDK adapter.",
+              cause,
+            }),
       ),
     ),
 );

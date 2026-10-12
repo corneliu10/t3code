@@ -1278,6 +1278,77 @@ describe("ClaudeAdapterV2 executable path", () => {
   );
 });
 
+const createClaudeAdapterWithHomes = (
+  config: Pick<ClaudeSettings, "homePath" | "shadowHomePath">,
+) =>
+  ClaudeAdapterV2.createClaudeAdapterV2(
+    {
+      instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+      displayName: undefined,
+      environment: [],
+      enabled: true,
+      config: { ...DEFAULT_CLAUDE_SETTINGS, ...config },
+    },
+    {},
+  ).pipe(
+    Effect.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-claude-shadow-home-" })),
+    Effect.provideService(ClaudeAdapterV2.ClaudeAgentSdkQueryRunner, {
+      allocateSessionId: Effect.succeed("native-thread-claude-shadow-home"),
+      open: () => Effect.die("unused"),
+      forkSession: () => Effect.die("unused"),
+      subagentLaunchToolUseId: () => Effect.succeed(null),
+      assertComplete: Effect.void,
+    }),
+  );
+
+describe("ClaudeAdapterV2 shadow home", () => {
+  it.effect("links the shared session history into the account's shadow home on create", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-homes-" });
+        const shared = path.join(root, "shared");
+        const shadow = path.join(root, "work");
+
+        yield* createClaudeAdapterWithHomes({ homePath: shared, shadowHomePath: shadow });
+
+        assert.equal(
+          yield* fileSystem.readLink(path.join(shadow, "projects")),
+          path.join(shared, "projects"),
+        );
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("fails create with the shadow home's own explanation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-homes-" });
+        const shared = path.join(root, "shared");
+
+        const error = yield* createClaudeAdapterWithHomes({
+          homePath: shared,
+          shadowHomePath: path.join(shared, "work"),
+        }).pipe(Effect.flip);
+
+        assert.equal(error._tag, "ProviderAdapterDriverCreateError");
+        assert.include(error.message, "must be separate directories, neither inside the other");
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+});
+
 describe("ClaudeAdapterV2 resume compaction", () => {
   it.effect("resolves and cancels the SDK resume dialog through structured runtime input", () =>
     Effect.scoped(

@@ -66,11 +66,8 @@ import {
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
 } from "@t3tools/provider-core/server/snapshotSettings";
-import {
-  makeClaudeCapabilitiesCacheKey,
-  makeClaudeContinuationGroupKey,
-  resolveClaudeHomePath,
-} from "./ClaudeHome.ts";
+import { makeClaudeCapabilitiesCacheKey } from "./ClaudeHome.ts";
+import { materializeClaudeShadowHome, resolveClaudeHomeLayout } from "./ClaudeHomeLayout.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -151,13 +148,27 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           Effect.provideService(Path.Path, path),
         ),
       );
-      const continuationGroupKey = yield* makeClaudeContinuationGroupKey(
-        effectiveConfig,
-        processEnv,
+      const homeLayout = yield* resolveClaudeHomeLayout(effectiveConfig, processEnv);
+      yield* materializeClaudeShadowHome(homeLayout).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderDriverError({
+              driver: DRIVER_KIND,
+              instanceId,
+              detail: cause.message,
+              cause,
+            }),
+        ),
       );
-      const configDir = yield* resolveClaudeHomePath(effectiveConfig, processEnv);
+      const continuationGroupKey = homeLayout.continuationKey;
+      // The account home holds this instance's login, `.claude.json` and
+      // `.credentials.json`; in direct mode it is the shared home.
+      const configDir = homeLayout.effectiveHomePath;
+      // A default home keeps `.claude.json` beside `~/.claude`, not inside it.
       const accountConfigPath = yield* ClaudeResetCredits.claudeAccountConfigPath(
-        effectiveConfig.homePath.trim() || processEnv.CLAUDE_CONFIG_DIR?.trim()
+        homeLayout.mode === "authOverlay" ||
+          effectiveConfig.homePath.trim() ||
+          processEnv.CLAUDE_CONFIG_DIR?.trim()
           ? configDir
           : undefined,
       );
@@ -197,7 +208,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         modelCatalog,
       );
 
-      // Per-instance capabilities cache: keyed on binary + resolved HOME so
+      // Per-instance capabilities cache: keyed on binary + account home so
       // account-specific probes never share auth metadata across instances.
       const capabilitiesProbeCache = yield* Cache.make({
         capacity: 1,

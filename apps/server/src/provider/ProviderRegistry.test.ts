@@ -6,6 +6,7 @@ import { describe, it, assert, expect } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -3149,6 +3150,45 @@ it.layer(
                 stderr: "",
                 code: 0,
               };
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("warns when a shared settings.json signs every shadow-home account in", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-status-" });
+        const sharedHome = path.join(root, "shared");
+        const helperValue = "helper-command-value-5d1e";
+        yield* fileSystem.makeDirectory(sharedHome);
+        yield* fileSystem.writeFileString(
+          path.join(sharedHome, "settings.json"),
+          JSON.stringify({ apiKeyHelper: helperValue }),
+        );
+
+        const status = yield* checkClaudeProviderStatus(
+          {
+            ...defaultClaudeSettings,
+            homePath: sharedHome,
+            shadowHomePath: path.join(root, "work"),
+          },
+          claudeCapabilities({ subscriptionType: "max", tokenSource: "claude.ai" }),
+        );
+        assert.strictEqual(status.status, "warning");
+        assert.strictEqual(status.auth.status, "authenticated");
+        assert.strictEqual(
+          status.message,
+          "Shared settings.json sets apiKeyHelper, so every account using this shared home authenticates with it.",
+        );
+        assert.notInclude(JSON.stringify(status), helperValue);
+      }).pipe(
+        Effect.provide(
+          layerMockSpawner((args) => {
+            const joined = args.join(" ");
+            if (joined === "--version") return { stdout: "2.1.296\n", stderr: "", code: 0 };
             throw new Error(`Unexpected args: ${joined}`);
           }),
         ),

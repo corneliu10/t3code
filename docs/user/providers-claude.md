@@ -32,7 +32,8 @@ instead can put credentials where this provider will not find them.
 Check the account reported in provider settings after signing in. Existing
 threads can switch only between Claude instances with the same config directory.
 Separate account directories stay isolated, including their local conversation
-state. Claude does not have Codex's shared-home and shadow-home arrangement.
+state. To let accounts share one history, see
+[Several Claude accounts, one history](#several-claude-accounts-one-history).
 
 For presets that differ only in API keys or endpoints, use the instance's
 **Environment variables**. Variable assignments do not belong in **Launch arguments**.
@@ -40,6 +41,45 @@ For presets that differ only in API keys or endpoints, use the instance's
 Claude Code's verbose mode can stay enabled when you use Claude for text generation, including
 thread titles, branch names, commit messages, and pull request descriptions. On a remote connection,
 T3 Code uses the Claude configuration on the connected server.
+
+## Several Claude accounts, one history
+
+A shared Claude home with a shadow home per account lets several Claude
+subscriptions continue the same threads. When one account runs low, switch to
+another in the thread's model picker and Claude picks up the conversation where
+it left off. Each account keeps its own login; sessions, history, skills,
+commands, agents, plugins, `settings.json` and `CLAUDE.md` are shared.
+
+On the environment's machine, sign the second account into its own directory:
+
+```bash
+mkdir -p ~/.claude_personal
+CLAUDE_CONFIG_DIR=~/.claude_personal claude auth login
+```
+
+Then set both paths in **Settings > Providers**:
+
+| Instance        | CLAUDE_CONFIG_DIR path | Shadow home path     |
+| --------------- | ---------------------- | -------------------- |
+| Claude Work     | Leave empty            | Leave empty          |
+| Claude Personal | Leave empty            | `~/.claude_personal` |
+
+**CLAUDE_CONFIG_DIR path** is the shared home; empty means Claude's default
+`~/.claude`. Every account that should share history must use the same one. The
+shadow home is that account's own directory; T3 Code links the shared state into
+it, so do not copy your Claude setup there.
+
+If the shadow directory was a separate Claude account before, move its sessions
+into the shared home once: move everything in `~/.claude_personal/projects/` into
+`~/.claude/projects/`. T3 Code replaces empty folders by itself. Anything else in
+the way is named in provider settings: move its contents into the shared home,
+delete it,
+and restart T3 Code.
+
+If the shared `settings.json` sets `apiKeyHelper`, `forceLoginOrgUUID`,
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, every account signs in with that
+instead of its own login, and provider settings show a warning. Put
+per-account credentials in each instance's **Environment variables** instead.
 
 ## Compact long conversations
 

@@ -638,6 +638,41 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("scans a Claude home shared by two shadow-home accounts once", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const sharedHome = yield* makeTempDir("t3code-claude-shared-");
+        const accounts = yield* makeTempDir("t3code-claude-accounts-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+
+        yield* writeTranscript({
+          filePath: path.join(sharedHome, "projects", "-shared", "session.jsonl"),
+          contents: claudeSessionLine(workspace),
+          mtimeMs: Date.parse("2026-01-01T00:00:00.000Z"),
+        });
+
+        const result = yield* runScan({
+          claudeHomePath,
+          codexHomePath,
+          providerInstances: {
+            [ProviderInstanceId.make("claude_work")]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              config: { homePath: sharedHome, shadowHomePath: path.join(accounts, "work") },
+            },
+            [ProviderInstanceId.make("claude_personal")]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              config: { homePath: sharedHome, shadowHomePath: path.join(accounts, "personal") },
+            },
+          },
+        });
+
+        expect(result.candidates.map((candidate) => candidate.path)).toEqual([workspace]);
+        expect(result.candidates.map((candidate) => candidate.threadCount)).toEqual([1]);
+      }),
+    );
+
     it.effect("honors provider instance home directory environment variables", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

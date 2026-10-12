@@ -14,7 +14,7 @@
  * @module provider/Drivers/ClaudeSkills
  */
 
-import type { ClaudeSettings, ServerProviderSkill } from "@t3tools/contracts";
+import type { ServerProviderSkill } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -23,7 +23,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import { parse as parseYamlDocument } from "yaml";
 
-import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+import { type ClaudeHomeConfig, resolveClaudeAccountHomePath } from "./ClaudeHome.ts";
 
 type ClaudeSkillScope = "user" | "project";
 
@@ -285,20 +285,20 @@ const readSkillOverrides = Effect.fn("readSkillOverrides")(function* (
 
 /**
  * Resolve the Claude config directory the CLI would use, matching the
- * precedence the spawned CLI sees: the instance's `homePath` (exported as
- * `CLAUDE_CONFIG_DIR` by `makeClaudeEnvironment`), then a `CLAUDE_CONFIG_DIR`
- * already present in the process environment, then `~/.claude`.
+ * precedence the spawned CLI sees: the account home `makeClaudeEnvironment`
+ * exports as `CLAUDE_CONFIG_DIR` (the shadow home, else `homePath`), then a
+ * `CLAUDE_CONFIG_DIR` already present in the process environment, then
+ * `~/.claude`.
  */
 const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath")(function* (
-  config: Pick<ClaudeSettings, "homePath">,
+  config: ClaudeHomeConfig,
   environment: NodeJS.ProcessEnv,
   cwd?: string,
 ): Effect.fn.Return<string, never, Path.Path> {
   const path = yield* Path.Path;
   const home = yield* HostProcess.HomeDirectory;
-  const homePath = config.homePath.trim();
-  if (homePath.length > 0) {
-    return path.resolve(expandHomePath(homePath, home));
+  if (config.homePath.trim().length > 0 || (config.shadowHomePath?.trim() ?? "").length > 0) {
+    return yield* resolveClaudeAccountHomePath(config, environment);
   }
   // No tilde expansion here: the spawned CLI receives this env var verbatim
   // (env vars are never shell-expanded), so a literal `~` must stay literal
@@ -323,7 +323,7 @@ const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath")(funct
  * Claude Code resolves elsewhere.
  */
 export const discoverClaudeSkills = Effect.fn("discoverClaudeSkills")(function* (
-  config: Pick<ClaudeSettings, "homePath">,
+  config: ClaudeHomeConfig,
   cwd?: string,
   environment?: NodeJS.ProcessEnv,
 ): Effect.fn.Return<ReadonlyArray<ServerProviderSkill>, never, FileSystem.FileSystem | Path.Path> {

@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import { ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
 
+import { ClaudeProviderCapabilitiesV2 } from "./Adapters/ClaudeAdapterV2.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import { decideProviderSessionTransition } from "./ProviderSessionTransitionPolicy.ts";
 
@@ -170,6 +171,32 @@ it("uses portable handoff for cross-driver transitions", () => {
         },
         available: true,
       },
+    }),
+    { type: "create_with_handoff" },
+  );
+});
+
+it("resumes natively across Claude accounts that share one Claude home", () => {
+  const claudeDriver = ProviderDriverKind.make("claudeAgent");
+  const claudeAccount = (instance: string, continuationKey: string) => ({
+    ...base,
+    driver: claudeDriver,
+    continuationIdentity: { driverKind: claudeDriver, continuationKey },
+    modelSelection: { instanceId: ProviderInstanceId.make(instance), model: "claude-opus-4-1" },
+    capabilities: ClaudeProviderCapabilitiesV2,
+  });
+
+  assert.deepEqual(
+    decideProviderSessionTransition({
+      current: claudeAccount("claude_work", "claude:home:/shared"),
+      target: { ...claudeAccount("claude_personal", "claude:home:/shared"), available: true },
+    }),
+    { type: "restart_and_resume" },
+  );
+  assert.deepEqual(
+    decideProviderSessionTransition({
+      current: claudeAccount("claude_work", "claude:home:/a"),
+      target: { ...claudeAccount("claude_personal", "claude:home:/b"), available: true },
     }),
     { type: "create_with_handoff" },
   );
