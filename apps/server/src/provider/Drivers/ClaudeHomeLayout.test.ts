@@ -9,7 +9,9 @@ import * as PlatformError from "effect/PlatformError";
 
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import {
+  CLAUDE_SHARED_CREATED_FILES,
   CLAUDE_SHARED_DIRECTORIES,
+  CLAUDE_SHARED_OPTIONAL_FILES,
   ClaudeShadowHomeEntryConflictError,
   ClaudeShadowHomePathConflictError,
   materializeClaudeShadowHome,
@@ -50,6 +52,29 @@ const isSymlink = Effect.fn("ClaudeHomeLayout.test.isSymlink")(function* (linkPa
 });
 
 it.layer(NodeServices.layer)("ClaudeHomeLayout", (it) => {
+  describe("shared entry allowlists", () => {
+    // The allowlist is what keeps logins and org-bound files private. Any
+    // change to it must be deliberate, so the exact lists are pinned here.
+    it("shares exactly the allowlisted directories and files", () => {
+      expect(CLAUDE_SHARED_DIRECTORIES).toEqual([
+        "projects",
+        "file-history",
+        "tasks",
+        "todos",
+        "plans",
+        "session-env",
+        "shell-snapshots",
+        "paste-cache",
+        "agents",
+        "commands",
+        "skills",
+        "plugins",
+      ]);
+      expect(CLAUDE_SHARED_CREATED_FILES).toEqual(["history.jsonl"]);
+      expect(CLAUDE_SHARED_OPTIONAL_FILES).toEqual(["settings.json", "CLAUDE.md"]);
+    });
+  });
+
   describe("resolveClaudeHomeLayout", () => {
     it.effect("uses the configured home directly when no shadow home is set", () =>
       Effect.gen(function* () {
