@@ -1109,6 +1109,31 @@ export const StorageCleanupSettings = Schema.Struct({
 });
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
+/**
+ * One account in the usage-limit failover chain. `model` pins the model the
+ * run continues with on this account; without it the failing run's model
+ * carries over when the account can run it, else the account's default.
+ */
+export const UsageLimitFailoverChainEntry = Schema.Struct({
+  instanceId: ProviderInstanceId,
+  model: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type UsageLimitFailoverChainEntry = typeof UsageLimitFailoverChainEntry.Type;
+
+/**
+ * When a thread's run stops on a provider usage limit and `enabled` is set, the
+ * server continues it on the next account in `chain`, in the order the user
+ * wrote it. Entries naming an account that was deleted or disabled are skipped,
+ * not rejected, so the chain survives an account being removed.
+ */
+export const UsageLimitFailoverSettings = Schema.Struct({
+  enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  chain: Schema.Array(UsageLimitFailoverChainEntry).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+});
+export type UsageLimitFailoverSettings = typeof UsageLimitFailoverSettings.Type;
+
 export const ServerSettings = Schema.Struct({
   // Null means no client has migrated this preference yet; an empty value is
   // authoritative so another device cannot resurrect cleared preferences.
@@ -1210,6 +1235,9 @@ export const ServerSettings = Schema.Struct({
   ),
   snoozeLimitedThreads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   autoResumeLimitedThreads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  usageLimitFailover: UsageLimitFailoverSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed({ enabled: false, chain: [] })),
+  ),
   sidebarAutoSettleOnMerge: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   backgroundActivity: BackgroundActivitySettings,
   // Legacy flat fields retained for old settings files and old clients. New
@@ -1586,6 +1614,8 @@ export const ServerSettingsPatch = Schema.Struct({
   sidebarAutoSettleAfterDays: Schema.optionalKey(Schema.NullOr(SidebarAutoSettleAfterDays)),
   sidebarAutoSettleOnMerge: Schema.optionalKey(Schema.Boolean),
   autoResumeLimitedThreads: Schema.optionalKey(Schema.Boolean),
+  /** Send it whole: a half the patch omits decodes to its default and overwrites the stored one. */
+  usageLimitFailover: Schema.optionalKey(UsageLimitFailoverSettings),
   snoozeLimitedThreads: Schema.optionalKey(Schema.Boolean),
   backgroundActivity: Schema.optionalKey(
     Schema.Struct({

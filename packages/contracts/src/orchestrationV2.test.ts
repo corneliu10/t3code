@@ -32,6 +32,8 @@ import {
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
+  OrchestrationV2Run,
+  OrchestrationV2RunJson,
   OrchestrationV2RpcSchemas,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2SubscribeThreadInput,
@@ -1566,5 +1568,81 @@ describe("latestProviderTurnForAttempt", () => {
     ];
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+  });
+});
+
+describe("provider failover marker", () => {
+  const decodeRun = Schema.decodeUnknownSync(OrchestrationV2Run);
+  const decodeRunJson = Schema.decodeUnknownSync(OrchestrationV2RunJson);
+  const encodeRunJson = Schema.encodeSync(OrchestrationV2RunJson);
+  const run = {
+    id: "run-2",
+    threadId: "thread-1",
+    ordinal: 2,
+    providerInstanceId: "claude-personal",
+    modelSelection: { instanceId: "claude-personal", model: "claude-opus-4-6" },
+    providerThreadId: null,
+    userMessageId: "message-2",
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "queued",
+    requestedAt: "2026-10-13T10:00:00.000Z",
+    startedAt: null,
+    completedAt: null,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  const providerFailover = {
+    reason: "usage_limit",
+    fromProviderInstanceId: "claude-work",
+    fromResetsAt: "2026-10-13T15:00:00.000Z",
+  };
+
+  it("decodes a run with and without the marker", () => {
+    expect(decodeRun({ ...run, requestedAt: now }).providerFailover).toBeUndefined();
+    expect(decodeRunJson(run)).not.toHaveProperty("providerFailover");
+    expect(decodeRun({ ...run, requestedAt: now, providerFailover }).providerFailover).toEqual(
+      providerFailover,
+    );
+  });
+
+  it("keeps the marker through the JSON variant, with or without a reset time", () => {
+    const encoded = encodeRunJson(decodeRunJson({ ...run, providerFailover }));
+    expect(encoded).toMatchObject({ providerFailover });
+
+    const atStart = { reason: "usage_limit_at_start", fromProviderInstanceId: "claude-work" };
+    const withoutReset = encodeRunJson(decodeRunJson({ ...run, providerFailover: atStart }));
+    expect(withoutReset.providerFailover).toEqual(atStart);
+    expect(withoutReset.providerFailover).not.toHaveProperty("fromResetsAt");
+  });
+
+  it("rejects a reason other than the two failover causes", () => {
+    expect(() =>
+      decodeRunJson({ ...run, providerFailover: { ...providerFailover, reason: "manual" } }),
+    ).toThrow();
+    expect(() => decodeRunJson({ ...run, providerFailover: { reason: "usage_limit" } })).toThrow();
+  });
+
+  it("lets message.dispatch carry the marker", () => {
+    const dispatch = {
+      type: "message.dispatch",
+      createdBy: "system",
+      creationSource: "server",
+      commandId: "command-failover",
+      threadId: "thread-1",
+      messageId: "message-failover",
+      text: "Continue where you left off.",
+      attachments: [],
+      usageLimitContinuationOfRunId: "run-1",
+      providerFailover,
+      dispatchMode: { type: "start_immediately" },
+    };
+    const command = decodeOrchestrationV2Command(dispatch);
+    if (command.type !== "message.dispatch") {
+      throw new Error(`Expected message.dispatch, received ${command.type}.`);
+    }
+    expect(command.providerFailover).toEqual(providerFailover);
+    const { providerFailover: _omitted, ...without } = dispatch;
+    expect(decodeOrchestrationV2Command(without)).not.toHaveProperty("providerFailover");
   });
 });

@@ -540,6 +540,20 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 /** Failure code on the error item a failed workspace preparation leaves. */
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+/**
+ * Why a run started on a different account than the one it continues from.
+ * `usage_limit`: the previous run stopped on that account's limit.
+ * `usage_limit_at_start`: the account the user picked was already out of
+ * quota, so the run never started there. `fromResetsAt` is when that account
+ * resets, when the provider reported one.
+ */
+export const OrchestrationV2ProviderFailover = Schema.Struct({
+  reason: Schema.Literals(["usage_limit", "usage_limit_at_start"]),
+  fromProviderInstanceId: ProviderInstanceId,
+  fromResetsAt: Schema.optional(IsoDateTime),
+});
+export type OrchestrationV2ProviderFailover = typeof OrchestrationV2ProviderFailover.Type;
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
@@ -561,6 +575,8 @@ export const OrchestrationV2Run = Schema.Struct({
   contextHandoffId: Schema.NullOr(ContextHandoffId),
   /** Links server-generated restart continuations to the interrupted run. */
   restartContinuationOfRunId: Schema.optional(RunId),
+  /** Set when this run continues on another account because of a usage limit. */
+  providerFailover: Schema.optional(OrchestrationV2ProviderFailover),
   /** The delegated task this run answers, including a follow-up in an existing child thread. */
   delegatedTaskId: Schema.optional(NodeId),
   /**
@@ -2944,6 +2960,8 @@ export const OrchestrationV2Command = Schema.Union([
     sourcePlanRef: Schema.optional(Schema.Struct({ threadId: ThreadId, planId: PlanId })),
     restartContinuationOfRunId: Schema.optional(RunId),
     usageLimitContinuationOfRunId: Schema.optional(RunId),
+    /** Copied onto the run this dispatch creates. */
+    providerFailover: Schema.optional(OrchestrationV2ProviderFailover),
     manualContinuationOfRunId: Schema.optional(RunId),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),
     /** Resolve untargeted delivery against the server's serialized thread state. */

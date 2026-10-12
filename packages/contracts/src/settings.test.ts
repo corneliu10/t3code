@@ -236,6 +236,66 @@ describe("custom model settings", () => {
   });
 });
 
+describe("ServerSettings usage-limit failover", () => {
+  const chain = [
+    { instanceId: "claude-work", model: "claude-opus-4-6" },
+    { instanceId: "codex" },
+    { instanceId: "claude-personal", model: "claude-sonnet-4-6" },
+  ];
+
+  it("is off with an empty chain for settings saved before it existed", () => {
+    expect(decodeServerSettings({}).usageLimitFailover).toEqual({ enabled: false, chain: [] });
+    expect(DEFAULT_SERVER_SETTINGS.usageLimitFailover).toEqual({ enabled: false, chain: [] });
+  });
+
+  it("round-trips the chain in order, keeping each entry's optional model", () => {
+    const stored = { usageLimitFailover: { enabled: true, chain } };
+    const decoded = decodeServerSettings(stored);
+    expect(decoded.usageLimitFailover.chain.map((entry) => entry.instanceId)).toEqual([
+      "claude-work",
+      "codex",
+      "claude-personal",
+    ]);
+    expect(decoded.usageLimitFailover.chain[1]).not.toHaveProperty("model");
+    expect(encodeServerSettings(decoded).usageLimitFailover).toStrictEqual(
+      stored.usageLimitFailover,
+    );
+  });
+
+  it("fills in whichever half a stored value omits", () => {
+    expect(
+      decodeServerSettings({ usageLimitFailover: { enabled: true } }).usageLimitFailover,
+    ).toEqual({
+      enabled: true,
+      chain: [],
+    });
+    expect(decodeServerSettings({ usageLimitFailover: { chain } }).usageLimitFailover.enabled).toBe(
+      false,
+    );
+  });
+
+  it("rejects an entry without an account or with a blank model", () => {
+    for (const entry of [{ model: "claude-opus-4-6" }, { instanceId: "codex", model: "  " }]) {
+      expect(() =>
+        decodeServerSettings({ usageLimitFailover: { enabled: true, chain: [entry] } }),
+      ).toThrow();
+      expect(() =>
+        decodeServerSettingsPatch({ usageLimitFailover: { enabled: true, chain: [entry] } }),
+      ).toThrow();
+    }
+  });
+
+  it("is an optional patch key that carries the whole setting", () => {
+    expect(decodeServerSettingsPatch({})).not.toHaveProperty("usageLimitFailover");
+    const patch = { usageLimitFailover: { enabled: true, chain } };
+    expect(decodeServerSettingsPatch(patch)).toEqual(patch);
+    // Merged over the stored value, so a patch that omits the chain clears it.
+    expect(decodeServerSettingsPatch({ usageLimitFailover: { enabled: true } })).toEqual({
+      usageLimitFailover: { enabled: true, chain: [] },
+    });
+  });
+});
+
 describe("ClaudeSettings shadow home", () => {
   it("decodes shadowHomePath with an empty default", () => {
     expect(decodeClaudeSettings({}).shadowHomePath).toBe("");

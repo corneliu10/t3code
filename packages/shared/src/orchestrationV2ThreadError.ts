@@ -2,6 +2,7 @@ import type {
   OrchestrationV2ProviderFailure,
   OrchestrationV2Run,
   OrchestrationV2TurnItem,
+  ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
@@ -91,6 +92,33 @@ export function usageLimitBlockedRun(
   if (executed?.status !== "failed") return null;
   const summary = threadErrorSummary(latestRootProviderFailure(executed, turnItems), sessionError);
   return summary.lastErrorClass === "usage_limit" ? executed : null;
+}
+
+/**
+ * Instances whose usage limit already ended a run since the thread's last
+ * completed run. A failover episode is that stretch of runs: it ends when a
+ * run completes, and the failover policy never offers one of these instances
+ * again inside it.
+ */
+export function usageLimitEpisodeAttemptedInstanceIds(
+  runs: ReadonlyArray<OrchestrationV2Run>,
+  turnItems: ReadonlyArray<OrchestrationV2TurnItem>,
+): ReadonlySet<ProviderInstanceId> {
+  let lastCompleted: OrchestrationV2Run | null = null;
+  for (const run of runs) {
+    if (run.status === "completed" && (lastCompleted === null || runRanAfter(run, lastCompleted))) {
+      lastCompleted = run;
+    }
+  }
+  const attempted = new Set<ProviderInstanceId>();
+  for (const run of runs) {
+    if (run.status !== "failed") continue;
+    if (lastCompleted !== null && !runRanAfter(run, lastCompleted)) continue;
+    if (latestRootProviderFailure(run, turnItems)?.class === "usage_limit") {
+      attempted.add(run.providerInstanceId);
+    }
+  }
+  return attempted;
 }
 
 /**
