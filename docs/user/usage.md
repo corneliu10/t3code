@@ -126,9 +126,10 @@ using a proxy through `ANTHROPIC_AUTH_TOKEN`.
 When a usage limit stops a thread, T3 Code can continue it on the next account in a list you
 choose, so work keeps going while one subscription is out. In **Settings → General**, turn on
 **Continue on another account** next to **Auto-resume limited threads**, then add accounts in the
-order to try them. Each account keeps the thread's model unless you pick one for it. Accounts can
-belong to different providers, so a Claude thread can continue on Codex. The thread shows which
-account it moved from and to.
+order to try them. An account uses the model you pick for it. Without one, it keeps the thread's
+model when it is the same provider and offers that model, and otherwise uses its default model.
+Accounts can belong to different providers, so a Claude thread can continue on Codex. The thread
+shows which account it moved from and to.
 
 New threads use the same list. If the account you choose is in it and is out of quota, the thread
 starts on the next account that has quota.

@@ -193,11 +193,16 @@ for custom configuration.
 
 **Limited** means the provider stopped on a usage or rate limit. The conversation
 keeps the provider's explanation. Retry after the limit resets, or switch to
-another provider instance.
+another provider instance. To switch automatically, see
+[Continue on another account](./usage.md#continue-on-another-account).
 On web and desktop, press **Resume** in an empty composer to continue a limited
 or interrupted turn manually.
 Queued messages stay saved while the limit blocks the thread. They run after
-the continuation finishes. If the queue was held by a restart, resume it then.
+the continuation finishes, each on the account it was queued for. A message
+queued before the thread continued on another account still goes to the limited
+account, and if that account is still out of quota the thread moves on again. To
+send it on the new account instead, remove it from the queue and send it again.
+If the queue was held by a restart, resume it then.
 
 When the provider reports a reset time, choose **Resume at reset** to schedule a
 continuation. You can cancel it from the thread. Enable **Auto-resume limited
