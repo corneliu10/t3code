@@ -5611,6 +5611,119 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     }),
   );
 
+  // A queued run stays bound to its own account's provider thread, attempt,
+  // root node and checkpoint scope, and a checkpoint scope cannot be rebound,
+  // so a failover does not move it. docs/user/thread-sidebar.md says so.
+  it.effect("starts a message queued before the limit on the account it was queued for", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const name = "queued-before-limit";
+        const threadId = ThreadId.make(`failover:${name}`);
+        const projectId = ProjectId.make(`failover:project:${name}`);
+        yield* seedProject({
+          projectId,
+          title: "Failover project",
+          workspaceRoot: process.cwd(),
+          defaultModelSelection: modelSelection,
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`failover:create:${name}`),
+          threadId,
+          projectId,
+          title: "Limited thread",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`failover:message:${name}`),
+          threadId,
+          messageId: MessageId.make(`failover:message:${name}`),
+          text: "Work on this.",
+          attachments: [],
+          dispatchMode: { type: "defer_start" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        // Sent while the first run works on the default account, so it waits
+        // in the queue on that account.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`failover:queued:${name}`),
+          threadId,
+          messageId: MessageId.make(`failover:queued:${name}`),
+          text: "Then this.",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const seeded = yield* orchestrator.getThreadProjection(threadId);
+        const limited = seeded.runs[0]!;
+        const queued = seeded.runs.find((run) => run.status === "queued")!;
+        assert.equal(queued.providerInstanceId, modelSelection.instanceId);
+        yield* limitRun(threadId, limited, `${name}:first`);
+
+        yield* orchestrator.dispatch(
+          failoverCommand({
+            key: name,
+            threadId,
+            continuationOf: limited.id,
+            from: modelSelection.instanceId,
+            to: alternateInstanceId,
+          }),
+        );
+        const failedOver = yield* orchestrator.getThreadProjection(threadId);
+        const continuation = failedOver.runs.find(
+          (run) => run.providerFailover?.fromProviderInstanceId === modelSelection.instanceId,
+        )!;
+        assert.equal(continuation.providerInstanceId, alternateInstanceId);
+
+        const startedRunIds = yield* Queue.unbounded<RunId>();
+        const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+        yield* eventSink.stream({ threadId, afterSequence }).pipe(
+          Stream.runForEach((stored) =>
+            stored.event.type === "run.updated" && stored.event.payload.status === "starting"
+              ? Queue.offer(startedRunIds, stored.event.payload.id)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+        const completedAt = yield* DateTime.now;
+        yield* eventSink.write({
+          commandId: CommandId.make(`failover:continuation-completed:${name}`),
+          events: [
+            {
+              id: EventId.make(`failover:continuation-completed:${name}`),
+              type: "run.updated",
+              threadId,
+              runId: continuation.id,
+              occurredAt: completedAt,
+              payload: { ...continuation, status: "completed", completedAt },
+            },
+          ],
+        });
+
+        assert.equal(yield* Queue.take(startedRunIds), queued.id);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        const started = after.runs.find((run) => run.id === queued.id)!;
+        assert.equal(started.providerInstanceId, modelSelection.instanceId);
+        assert.equal(after.thread.providerInstanceId, modelSelection.instanceId);
+      }),
+    ),
+  );
+
   it.effect("clears limit recovery and its snooze when a failover is accepted", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
