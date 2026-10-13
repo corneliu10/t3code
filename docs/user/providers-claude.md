@@ -48,7 +48,9 @@ A shared Claude home with a shadow home per account lets several Claude
 subscriptions continue the same threads. When one account runs low, switch to
 another in the thread's model picker and Claude picks up the conversation where
 it left off. Each account keeps its own login; sessions, history, skills,
-commands, agents, plugins, `settings.json` and `CLAUDE.md` are shared.
+commands, agents, plugins, `settings.json` and `CLAUDE.md` are shared. Each
+account also keeps its own `.claude.json`, so user-level MCP servers and project
+trust do not follow a switch to another Claude account.
 
 On the environment's machine, sign the second account into its own directory:
 
@@ -57,24 +59,33 @@ mkdir -p ~/.claude_personal
 CLAUDE_CONFIG_DIR=~/.claude_personal claude auth login
 ```
 
-Then set both paths in **Settings > Providers**:
+Then give that account's instance a shadow home in **Settings > Providers**,
+and leave both instances on the same shared home:
 
 | Instance        | CLAUDE_CONFIG_DIR path | Shadow home path     |
 | --------------- | ---------------------- | -------------------- |
 | Claude Work     | Leave empty            | Leave empty          |
 | Claude Personal | Leave empty            | `~/.claude_personal` |
 
-**CLAUDE_CONFIG_DIR path** is the shared home; empty means Claude's default
-`~/.claude`. Every account that should share history must use the same one. The
-shadow home is that account's own directory; T3 Code links the shared state into
-it, so do not copy your Claude setup there.
+**CLAUDE_CONFIG_DIR path** is the shared home. When it is empty, a
+`CLAUDE_CONFIG_DIR` set in the instance's **Environment variables** or inherited
+by T3 Code comes first, then Claude's default `~/.claude`. Every account that
+should share history must use the same one. The shadow home is that account's
+own directory; T3 Code links the shared state into it, so do not copy your
+Claude setup there.
 
-If the shadow directory was a separate Claude account before, move its sessions
-into the shared home once: move everything in `~/.claude_personal/projects/` into
-`~/.claude/projects/`. T3 Code replaces empty folders by itself. Anything else in
-the way is named in provider settings: move its contents into the shared home,
-delete it,
-and restart T3 Code.
+If the shadow directory was a separate Claude account before, its own state is
+in the way. Provider settings name every such entry at once. Fix them all, then
+restart T3 Code:
+
+- Folders such as `projects`, `file-history`, `todos`, `shell-snapshots` and
+  `plans`: move their contents into the same folder in the shared home, then
+  delete them.
+- `history.jsonl`: append it to the shared `history.jsonl`, then delete it.
+- `settings.json` or `CLAUDE.md`, when the shared home has one too: keep one in
+  the shared home, merging them by hand if needed, then delete the shadow's copy.
+
+T3 Code replaces empty folders by itself.
 
 If the shared `settings.json` sets `apiKeyHelper`, `forceLoginOrgUUID`,
 `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, every account signs in with that
