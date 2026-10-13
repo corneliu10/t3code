@@ -9,6 +9,7 @@ import {
   type ModelSelection,
   type OrchestrationV2Actor,
   type OrchestrationV2CreationSource,
+  type OrchestrationV2ProviderFailover,
   type OrchestrationV2ProviderThreadNativeMetadata,
   type OrchestrationV2ThreadProjection,
   type ProviderDriverKind,
@@ -17,10 +18,12 @@ import {
   type RunId,
   type RuntimeMode,
   type ScheduledTaskId,
+  resolveProjectProviderInstanceEnabled,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -48,6 +51,7 @@ import type * as Orchestrator from "./Orchestrator.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import { chooseFailoverTarget, providerQuotaState } from "./UsageLimitFailoverPolicy.ts";
 
 export type ThreadLaunchWorkspaceStrategy =
   | { readonly type: "root"; readonly branch?: string | undefined }
@@ -191,6 +195,33 @@ export class ThreadLaunchService extends Context.Service<
 >()("t3/orchestration-v2/ThreadLaunchService") {}
 
 const isThreadLaunchError = Schema.is(ThreadLaunchError);
+
+/** The account a launch starts on, and why it is not the one the caller chose. */
+interface LaunchModelSelection {
+  readonly modelSelection: ModelSelection;
+  readonly providerFailover?: OrchestrationV2ProviderFailover;
+}
+
+/**
+ * What a retried launch starts on. The create it replays recorded the account
+ * the first attempt settled on, so a later quota reading must not pick again:
+ * the thread and its first run would end up on different accounts.
+ */
+function recordedLaunchModelSelection(
+  requested: ModelSelection,
+  recorded: ModelSelection | undefined,
+): LaunchModelSelection {
+  if (recorded === undefined || recorded.instanceId === requested.instanceId) {
+    return { modelSelection: requested };
+  }
+  return {
+    modelSelection: recorded,
+    providerFailover: {
+      reason: "usage_limit_at_start",
+      fromProviderInstanceId: requested.instanceId,
+    },
+  };
+}
 
 function failureDetail(error: unknown): string {
   if (isThreadLaunchError(error)) {
@@ -749,6 +780,58 @@ const make = Effect.gen(function* () {
     );
   });
 
+  /**
+   * Pick-at-start. With usage-limit failover on, a new thread whose chosen
+   * account is in the chain and out of quota starts on the first chain account
+   * that has quota, and its first run is marked with why. Anything else,
+   * including a chain with no account left, keeps the chosen account.
+   *
+   * The chain is narrowed to the accounts the project allows first, so the
+   * account picked here always passes the enablement check. A chosen account
+   * the project turned off is not in that chain, and keeps being refused.
+   */
+  const resolveLaunchModelSelection = Effect.fn("ThreadLaunchService.resolveLaunchModelSelection")(
+    function* (projectId: ProjectId, requested: ModelSelection) {
+      const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
+      const failover = settings.usageLimitFailover;
+      if (!failover.enabled) return { modelSelection: requested } satisfies LaunchModelSelection;
+      const chain = failover.chain.filter((entry) =>
+        resolveProjectProviderInstanceEnabled(settings, projectId, entry.instanceId),
+      );
+      if (!chain.some((entry) => entry.instanceId === requested.instanceId)) {
+        return { modelSelection: requested } satisfies LaunchModelSelection;
+      }
+      const providers = yield* providerRegistry.getProviders;
+      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+      const quota = providerQuotaState(
+        providers.find((provider) => provider.instanceId === requested.instanceId),
+        nowMs,
+      );
+      if (quota.type !== "exhausted") {
+        return { modelSelection: requested } satisfies LaunchModelSelection;
+      }
+      const choice = chooseFailoverTarget({
+        chain,
+        failedInstanceId: requested.instanceId,
+        attempted: new Set(),
+        providers,
+        currentSelection: requested,
+        nowMs,
+      });
+      if (choice.type === "none") {
+        return { modelSelection: requested } satisfies LaunchModelSelection;
+      }
+      return {
+        modelSelection: choice.modelSelection,
+        providerFailover: {
+          reason: "usage_limit_at_start",
+          fromProviderInstanceId: requested.instanceId,
+          ...(quota.resetsAt === undefined ? {} : { fromResetsAt: quota.resetsAt }),
+        },
+      } satisfies LaunchModelSelection;
+    },
+  );
+
   const launch: ThreadLaunchService["Service"]["launch"] = Effect.fn("ThreadLaunchService.launch")(
     function* (input) {
       yield* ProjectCloneTracker.rejectCommandsDuringClone(cloneTracker, {
@@ -772,10 +855,21 @@ const make = Effect.gen(function* () {
       }
 
       const launchReceipt = yield* readReceipt(input, input.commandId);
+      // Only a launch that starts a run has anything to pick, and an imported
+      // native session belongs to the account that holds it. A retry whose
+      // create was accepted keeps what that create recorded (see below); a
+      // retry that claims an existing thread recorded no account, so it picks.
+      const picksAtStart =
+        input.initialMessage !== undefined && input.importedNativeThread === undefined;
+      const replaysCreate = input.reuseExistingThread !== true && Option.isSome(launchReceipt);
+      const picked: LaunchModelSelection =
+        picksAtStart && !replaysCreate
+          ? yield* resolveLaunchModelSelection(input.projectId, input.modelSelection)
+          : { modelSelection: input.modelSelection };
       yield* threads.assertProviderInstanceEnabled({
         projectId: input.projectId,
         commandId: input.commandId,
-        instanceId: input.modelSelection.instanceId,
+        instanceId: picked.modelSelection.instanceId,
       });
       return yield* Effect.gen(function* () {
         // A retried launch has no client-supplied id to replay against, so
@@ -851,7 +945,7 @@ const make = Effect.gen(function* () {
                 threadId: candidateThreadId,
                 projectId: input.projectId,
                 title: input.title,
-                modelSelection: input.modelSelection,
+                modelSelection: picked.modelSelection,
                 runtimeMode: input.runtimeMode,
                 interactionMode: input.interactionMode,
                 branch: initialBranch,
@@ -877,6 +971,20 @@ const make = Effect.gen(function* () {
         if (project.id !== input.projectId) {
           return yield* mapError(input, "resolve-project", threadId)("Project identity changed.");
         }
+
+        // A replayed create hands back the events of the attempt that made it.
+        const createdEvent = claimed.storedEvents.find(
+          (stored) => stored.event.type === "thread.created",
+        )?.event;
+        const launchSelection =
+          picksAtStart && replaysCreate
+            ? recordedLaunchModelSelection(
+                input.modelSelection,
+                createdEvent?.type === "thread.created"
+                  ? createdEvent.payload.modelSelection
+                  : undefined,
+              )
+            : picked;
 
         let runId: RunId | null = null;
         let messageWasAlreadyAccepted = false;
@@ -905,7 +1013,10 @@ const make = Effect.gen(function* () {
               attachments: input.initialMessage.attachments,
               ...(input.initialMessage.context ? { context: input.initialMessage.context } : {}),
               ...(input.generateTitle === true ? { titleSeed: input.title } : {}),
-              modelSelection: input.modelSelection,
+              modelSelection: launchSelection.modelSelection,
+              ...(launchSelection.providerFailover === undefined
+                ? {}
+                : { providerFailover: launchSelection.providerFailover }),
               dispatchMode: { type: "defer_start", workspaceStrategy },
               createdBy: input.createdBy,
               creationSource: input.creationSource,

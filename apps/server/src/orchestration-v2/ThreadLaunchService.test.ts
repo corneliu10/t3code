@@ -23,7 +23,7 @@ import {
   ProviderInstanceId,
   OrchestrationV2ThreadProjectionJson,
   ScheduledTaskId,
-  type ServerProvider,
+  ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -107,12 +107,14 @@ interface HarnessOptions {
   readonly generateBranchName?: TextGeneration.TextGeneration["Service"]["generateBranchName"];
   readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   readonly providers?: ReadonlyArray<ServerProvider>;
+  /** Defaults to the single `codex` adapter; a launch on another instance needs its own. */
+  readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly git?: Partial<GitWorkflow.GitWorkflowService["Service"]>;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
   const layerDatabase = SqlitePersistence.layerMemory;
-  const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([adapter]);
+  const layerRegistry = ProviderAdapterRegistry.layerFromAdapters(options.adapters ?? [adapter]);
   const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
     { name: "thread-launch" },
     layerRegistry,
@@ -2704,4 +2706,437 @@ it.effect("replays an accepted message.dispatch after the project disables the i
       assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${fresh._tag}`);
     }
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
+});
+
+const decodeServerProvider = Schema.decodeUnknownSync(ServerProvider);
+const failoverFrom = modelSelection.instanceId;
+const failoverTo = ProviderInstanceId.make("codex-b");
+const failoverThird = ProviderInstanceId.make("codex-c");
+const quotaResetsAt = "2030-01-01T00:00:00.000Z";
+
+/** A ready codex account; `usedPercent` adds one usage window, none leaves its quota unknown. */
+function quotaProvider(
+  instanceId: ProviderInstanceId,
+  window?: { readonly usedPercent: number; readonly resetsAt?: string },
+) {
+  return decodeServerProvider({
+    instanceId,
+    driver: "codex",
+    enabled: true,
+    installed: true,
+    version: null,
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: "2026-07-28T00:00:00.000Z",
+    availability: "available",
+    models: [
+      {
+        slug: modelSelection.model,
+        name: modelSelection.model,
+        isCustom: false,
+        isDefault: true,
+        capabilities: null,
+      },
+    ],
+    slashCommands: [],
+    skills: [],
+    ...(window === undefined
+      ? {}
+      : {
+          usageLimits: {
+            checkedAt: "2026-07-28T00:00:00.000Z",
+            windows: [
+              {
+                id: "five_hour",
+                kind: "session",
+                label: "5 hour",
+                usedPercent: window.usedPercent,
+                ...(window.resetsAt === undefined ? {} : { resetsAt: window.resetsAt }),
+              },
+            ],
+          },
+        }),
+  });
+}
+
+function makeFailoverHarness(input: {
+  readonly enabled?: boolean;
+  readonly chain: ReadonlyArray<ProviderInstanceId>;
+  readonly providers: ReadonlyArray<ServerProvider>;
+  readonly projectSettingsOverrides?: NonNullable<
+    HarnessOptions["serverSettings"]
+  >["projectSettingsOverrides"];
+}) {
+  const configured = { driver: ProviderDriverKind.make("codex"), config: {} };
+  return makeHarness({
+    serverSettings: {
+      providerInstances: { [failoverTo]: configured, [failoverThird]: configured },
+      usageLimitFailover: {
+        enabled: input.enabled ?? true,
+        chain: input.chain.map((instanceId) => ({ instanceId })),
+      },
+      ...(input.projectSettingsOverrides === undefined
+        ? {}
+        : { projectSettingsOverrides: input.projectSettingsOverrides }),
+    },
+    providers: input.providers,
+    adapters: [
+      adapter,
+      { ...adapter, instanceId: failoverTo },
+      { ...adapter, instanceId: failoverThird },
+    ],
+  });
+}
+
+it.effect(
+  "starts a new thread on the next chain account when the chosen one is out of quota",
+  () => {
+    const harness = makeFailoverHarness({
+      chain: [failoverFrom, failoverTo],
+      providers: [
+        quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+        quotaProvider(failoverTo, { usedPercent: 20 }),
+      ],
+    });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "command:launch:at-start",
+          thread: "thread:launch:at-start",
+          message: "Hello",
+        }),
+      );
+      assert.equal(launched.projection.thread.modelSelection.instanceId, failoverTo);
+      assert.equal(launched.projection.runs.length, 1);
+      // The run, not only the dispatch, carries why it is not on the chosen account.
+      assert.equal(launched.projection.runs[0]?.modelSelection.instanceId, failoverTo);
+      assert.deepEqual(launched.projection.runs[0]?.providerFailover, {
+        reason: "usage_limit_at_start",
+        fromProviderInstanceId: failoverFrom,
+        fromResetsAt: quotaResetsAt,
+      });
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("marks a start-time failover without a reset time when the account reports none", () => {
+  const harness = makeFailoverHarness({
+    chain: [failoverFrom, failoverTo],
+    providers: [quotaProvider(failoverFrom, { usedPercent: 100 }), quotaProvider(failoverTo)],
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:at-start-no-reset",
+        thread: "thread:launch:at-start-no-reset",
+        message: "Hello",
+      }),
+    );
+    assert.equal(launched.projection.runs[0]?.modelSelection.instanceId, failoverTo);
+    assert.deepEqual(launched.projection.runs[0]?.providerFailover, {
+      reason: "usage_limit_at_start",
+      fromProviderInstanceId: failoverFrom,
+    });
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect.each([
+  {
+    name: "the chosen account has quota",
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 40, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+    ],
+  },
+  {
+    name: "the chosen account's quota is unknown",
+    chain: [failoverFrom, failoverTo],
+    providers: [quotaProvider(failoverFrom), quotaProvider(failoverTo, { usedPercent: 0 })],
+  },
+  {
+    name: "the chosen account is not in the chain",
+    chain: [failoverTo, failoverThird],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+      quotaProvider(failoverThird, { usedPercent: 0 }),
+    ],
+  },
+  {
+    name: "failover is off",
+    enabled: false,
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+    ],
+  },
+  {
+    name: "every chain account is out of quota",
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 100, resetsAt: quotaResetsAt }),
+    ],
+  },
+])("keeps the chosen account for a new thread when $name", (scenario) => {
+  const harness = makeFailoverHarness(scenario);
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:at-start-unchanged",
+        thread: "thread:launch:at-start-unchanged",
+        message: "Hello",
+      }),
+    );
+    assert.equal(launched.projection.thread.modelSelection.instanceId, failoverFrom);
+    assert.equal(launched.projection.runs[0]?.modelSelection.instanceId, failoverFrom);
+    assert.isUndefined(launched.projection.runs[0]?.providerFailover);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("skips a chain account the project turned off when picking where a thread starts", () => {
+  const harness = makeFailoverHarness({
+    chain: [failoverFrom, failoverTo, failoverThird],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+      quotaProvider(failoverThird, { usedPercent: 0 }),
+    ],
+    projectSettingsOverrides: {
+      [projectId]: { providerInstances: { [failoverTo]: { enabled: false } } },
+    },
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:at-start-project-off",
+        thread: "thread:launch:at-start-project-off",
+        message: "Hello",
+      }),
+    );
+    assert.equal(launched.projection.runs[0]?.modelSelection.instanceId, failoverThird);
+    assert.equal(
+      launched.projection.runs[0]?.providerFailover?.fromProviderInstanceId,
+      failoverFrom,
+    );
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect(
+  "still refuses a chosen account the project turned off, even when it is out of quota",
+  () => {
+    const harness = makeFailoverHarness({
+      chain: [failoverFrom, failoverTo],
+      providers: [
+        quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+        quotaProvider(failoverTo, { usedPercent: 0 }),
+      ],
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [failoverFrom]: { enabled: false } } },
+      },
+    });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const failed = yield* launches
+        .launch(
+          launchInput({
+            command: "command:launch:at-start-chosen-off",
+            thread: "thread:launch:at-start-chosen-off",
+            message: "Hello",
+          }),
+        )
+        .pipe(Effect.flip);
+      assert.equal(failed._tag, "ThreadManagementProviderInstanceDisabledError");
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("leaves a thread with no first message on the chosen account", () => {
+  const harness = makeFailoverHarness({
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+    ],
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:at-start-no-message",
+        thread: "thread:launch:at-start-no-message",
+      }),
+    );
+    assert.equal(launched.projection.thread.modelSelection.instanceId, failoverFrom);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("keeps an imported native session on the account that owns it", () => {
+  const harness = makeFailoverHarness({
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+    ],
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch({
+      ...launchInput({
+        command: "command:launch:at-start-imported",
+        thread: "thread:launch:at-start-imported",
+        message: "Continue the imported session",
+      }),
+      importedNativeThread: {
+        ref: {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "native-session-at-start",
+          strength: "strong" as const,
+        },
+      },
+    });
+    assert.equal(launched.projection.thread.modelSelection.instanceId, failoverFrom);
+    assert.equal(launched.projection.runs[0]?.modelSelection.instanceId, failoverFrom);
+    assert.isUndefined(launched.projection.runs[0]?.providerFailover);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("replays a start-time failover on the account its first attempt recorded", () => {
+  const harness = makeFailoverHarness({
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+    ],
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const input = launchInput({
+      command: "command:launch:at-start-replay",
+      thread: "thread:launch:at-start-replay",
+      message: "Hello",
+    });
+    // The state a crash between the launch's two commands leaves: the create
+    // was accepted on the substituted account and the message never was.
+    yield* threads.dispatch({
+      type: "thread.create",
+      commandId: input.commandId,
+      threadId: input.threadId,
+      projectId,
+      title: input.title,
+      modelSelection: { ...modelSelection, instanceId: failoverTo },
+      runtimeMode: input.runtimeMode,
+      interactionMode: input.interactionMode,
+      branch: null,
+      worktreePath: null,
+      createdBy: input.createdBy,
+      creationSource: input.creationSource,
+    });
+    // The chosen account recovered since, so a fresh pick would keep it.
+    yield* settings.updateSettings({ usageLimitFailover: { enabled: false, chain: [] } });
+
+    const retried = yield* launches.launch(input);
+
+    assert.isTrue(retried.resumed);
+    assert.equal(retried.projection.thread.modelSelection.instanceId, failoverTo);
+    assert.equal(retried.projection.runs[0]?.modelSelection.instanceId, failoverTo);
+    assert.deepEqual(retried.projection.runs[0]?.providerFailover, {
+      reason: "usage_limit_at_start",
+      fromProviderInstanceId: failoverFrom,
+    });
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("does not move a retried launch off the account its first attempt created on", () => {
+  const harness = makeFailoverHarness({
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+    ],
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const input = launchInput({
+      command: "command:launch:at-start-replay-kept",
+      thread: "thread:launch:at-start-replay-kept",
+      message: "Hello",
+    });
+    // The first attempt created the thread while the chosen account had quota.
+    yield* threads.dispatch({
+      type: "thread.create",
+      commandId: input.commandId,
+      threadId: input.threadId,
+      projectId,
+      title: input.title,
+      modelSelection,
+      runtimeMode: input.runtimeMode,
+      interactionMode: input.interactionMode,
+      branch: null,
+      worktreePath: null,
+      createdBy: input.createdBy,
+      creationSource: input.creationSource,
+    });
+
+    const retried = yield* launches.launch(input);
+
+    assert.equal(retried.projection.thread.modelSelection.instanceId, failoverFrom);
+    assert.equal(retried.projection.runs[0]?.modelSelection.instanceId, failoverFrom);
+    assert.isUndefined(retried.projection.runs[0]?.providerFailover);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("also picks for a launch that claims an existing empty thread", () => {
+  const harness = makeFailoverHarness({
+    chain: [failoverFrom, failoverTo],
+    providers: [
+      quotaProvider(failoverFrom, { usedPercent: 100, resetsAt: quotaResetsAt }),
+      quotaProvider(failoverTo, { usedPercent: 0 }),
+    ],
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const input = {
+      ...launchInput({
+        command: "command:launch:at-start-reuse",
+        thread: "thread:launch:at-start-reuse",
+        message: "Hello",
+      }),
+      reuseExistingThread: true,
+    };
+    yield* threads.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("command:launch:at-start-reuse:create"),
+      threadId: input.threadId,
+      projectId,
+      title: input.title,
+      modelSelection,
+      runtimeMode: input.runtimeMode,
+      interactionMode: input.interactionMode,
+      branch: null,
+      worktreePath: null,
+      createdBy: input.createdBy,
+      creationSource: input.creationSource,
+    });
+
+    const launched = yield* launches.launch(input);
+
+    assert.equal(launched.projection.thread.modelSelection.instanceId, failoverTo);
+    assert.equal(launched.projection.runs[0]?.modelSelection.instanceId, failoverTo);
+    assert.deepEqual(launched.projection.runs[0]?.providerFailover, {
+      reason: "usage_limit_at_start",
+      fromProviderInstanceId: failoverFrom,
+      fromResetsAt: quotaResetsAt,
+    });
+  }).pipe(Effect.provide(harness.layer));
 });
