@@ -24,6 +24,7 @@ import {
   type ScopedThreadRef,
   ThreadId,
   SnapShotSource,
+  type OrchestrationV2Run,
 } from "@t3tools/contracts";
 import {
   parseScopedProjectKey,
@@ -78,6 +79,7 @@ import { useShallow } from "zustand/react/shallow";
 import { createDeferredStorage, createMemoryStorage } from "./lib/storage";
 import { getDefaultServerModel } from "./providerModels";
 import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
+import { isDraftAccountSupersededByFailover } from "@t3tools/client-runtime/provider-failover-draft";
 import { UnifiedSettings } from "@t3tools/contracts/settings";
 import { ReviewCommentContextSchema, type ReviewCommentContext } from "./reviewCommentContext";
 const isRuntimeMode = Schema.is(RuntimeMode);
@@ -253,6 +255,9 @@ const PersistedComposerThreadDraftState = Schema.Struct({
   // an entry already encodes "no selection for this instance".
   modelSelectionByProvider: Schema.optionalKey(Schema.Record(ProviderInstanceId, ModelSelection)),
   activeProvider: Schema.optionalKey(Schema.NullOr(ProviderInstanceId)),
+  // When `activeProvider` was last set (epoch ms), so a server failover off
+  // that account can tell an older pick from one made after it.
+  activeProviderSelectedAt: Schema.optionalKey(Schema.Number),
   // True only when a human picked this selection in the composer. Seeded
   // selections (project default / sticky) leave it unset so later seeds can
   // replace them; legacy entries predate the flag and read as seeded too.
@@ -406,6 +411,8 @@ export interface ComposerThreadDraftState {
   modelSelectionByProvider: Partial<Record<ProviderInstanceId, ModelSelection>>;
   /** Routing key of the last picked instance (see `modelSelectionByProvider`). */
   activeProvider: ProviderInstanceId | null;
+  /** When `activeProvider` was last set, in epoch ms. Absent on older drafts. */
+  activeProviderSelectedAt?: number;
   /**
    * True only when a human picked the active selection in the composer.
    * Absent/false means seeded (project default / sticky), so later seeds
@@ -715,6 +722,15 @@ interface ComposerDraftStoreState {
     attachments: PersistedComposerImageAttachment[],
   ) => Promise<void>;
   clearComposerContent: (threadRef: ComposerThreadTarget) => void;
+  /**
+   * Drops the draft's account when the server has since moved the thread off
+   * it after a usage limit, so the next message follows the thread instead of
+   * going back to the limited account.
+   */
+  reconcileProviderFailover: (
+    threadRef: ComposerThreadTarget,
+    runs: ReadonlyArray<Pick<OrchestrationV2Run, "requestedAt" | "providerFailover">>,
+  ) => void;
   /**
    * Clears the prompt text and attachments, preserving terminal /
    * element contexts, preview annotations, and review comments. Used by the
@@ -2289,6 +2305,9 @@ export function partializeComposerDraftStoreState(
               draft.modelSelectionByProvider,
             ),
             activeProvider: draft.activeProvider,
+            ...(draft.activeProviderSelectedAt === undefined
+              ? {}
+              : { activeProviderSelectedAt: draft.activeProviderSelectedAt }),
             ...(draft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
           }
         : {}),
@@ -2566,6 +2585,9 @@ function toHydratedThreadDraft(
     threadContexts: persistedDraft.threadContexts?.map((record) => ({ ...record })) ?? [],
     modelSelectionByProvider,
     activeProvider,
+    ...(persistedDraft.activeProviderSelectedAt === undefined
+      ? {}
+      : { activeProviderSelectedAt: persistedDraft.activeProviderSelectedAt }),
     ...(persistedDraft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
     runtimeMode: persistedDraft.runtimeMode ?? null,
     interactionMode: persistedDraft.interactionMode ?? null,
@@ -3189,6 +3211,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               ...restBase,
               modelSelectionByProvider: nextMap,
               activeProvider: nextActiveProvider,
+              ...(normalized ? { activeProviderSelectedAt: Date.now() } : {}),
               ...(opts?.explicit === true ? { modelSelectionExplicit: true as const } : {}),
             };
             const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
@@ -3341,7 +3364,9 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             const { modelSelectionExplicit: _previousExplicit, ...restBase } = base;
             const nextDraft: ComposerThreadDraftState = {
               ...restBase,
-              ...(options?.instanceId ? { activeProvider: instanceKey } : {}),
+              ...(options?.instanceId
+                ? { activeProvider: instanceKey, activeProviderSelectedAt: Date.now() }
+                : {}),
               modelSelectionByProvider: nextMap,
               modelSelectionExplicit: true,
             };
@@ -4204,6 +4229,45 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               previewAnnotations: [],
               reviewComments: [],
               threadContexts: [],
+            };
+            const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
+            if (shouldRemoveDraft(nextDraft)) {
+              delete nextDraftsByThreadKey[threadKey];
+            } else {
+              nextDraftsByThreadKey[threadKey] = nextDraft;
+            }
+            return { draftsByThreadKey: nextDraftsByThreadKey };
+          });
+        },
+        reconcileProviderFailover: (threadRef, runs) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
+          if (threadKey.length === 0) {
+            return;
+          }
+          set((state) => {
+            const current = state.draftsByThreadKey[threadKey];
+            if (
+              !current ||
+              current.activeProvider === null ||
+              !isDraftAccountSupersededByFailover({
+                draftInstanceId: current.activeProvider,
+                draftSelectedAt: current.activeProviderSelectedAt,
+                runs,
+              })
+            ) {
+              return state;
+            }
+            const {
+              modelSelectionExplicit: _explicit,
+              activeProviderSelectedAt: _selectedAt,
+              ...rest
+            } = current;
+            const { [current.activeProvider]: _limited, ...modelSelectionByProvider } =
+              current.modelSelectionByProvider;
+            const nextDraft: ComposerThreadDraftState = {
+              ...rest,
+              modelSelectionByProvider,
+              activeProvider: null,
             };
             const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
             if (shouldRemoveDraft(nextDraft)) {

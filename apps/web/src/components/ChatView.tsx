@@ -1711,6 +1711,21 @@ export default function ChatView(props: ChatViewProps) {
   });
   const serverThreadProjection = useThreadProjection(routeThreadDetailRef);
   const serverProjection = serverThreadProjection?.projection ?? null;
+  // The draft's account wins over the thread's, so once the server moves the
+  // thread off that account after a usage limit, the draft must let go of it.
+  const reconcileProviderFailover = useComposerDraftStore(
+    (store) => store.reconcileProviderFailover,
+  );
+  const serverRuns = routeKind === "server" ? serverProjection?.runs : undefined;
+  const routeDraftActiveProvider = useComposerDraftStore((store) =>
+    routeKind === "server"
+      ? (store.getComposerDraft(routeThreadRef)?.activeProvider ?? null)
+      : null,
+  );
+  useEffect(() => {
+    if (serverRuns === undefined || routeDraftActiveProvider === null) return;
+    reconcileProviderFailover(routeThreadRef, serverRuns);
+  }, [reconcileProviderFailover, routeDraftActiveProvider, routeThreadRef, serverRuns]);
   const reportedModelSelection = serverProjection
     ? deriveReportedModelSelection(serverProjection)
     : null;

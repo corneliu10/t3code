@@ -14,12 +14,14 @@ import {
   RuntimeMode as RuntimeModeSchema,
   type EnvironmentId,
   type ModelSelection,
+  type OrchestrationV2Run,
   type ProjectId,
   type ProviderInteractionMode,
   type ProviderOptionSelection,
   type RuntimeMode,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import { isDraftAccountSupersededByFailover } from "@t3tools/client-runtime/provider-failover-draft";
 import { useEffect } from "react";
 import { Atom } from "effect/reactivity";
 
@@ -330,6 +332,11 @@ export interface ComposerDraft {
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly importedShareIds?: ReadonlyArray<string>;
   readonly modelSelection?: ModelSelection;
+  /**
+   * When the user picked `modelSelection`, in epoch ms. Absent when the
+   * selection was written back from elsewhere, which counts as older.
+   */
+  readonly modelSelectionSelectedAt?: number;
   readonly runtimeMode?: RuntimeMode;
   readonly interactionMode?: ProviderInteractionMode;
   readonly workspaceSelection?: ComposerDraftWorkspaceSelection;
@@ -365,7 +372,12 @@ export interface ComposerDraftWorkspaceSelection {
 
 export type ComposerDraftSettingsUpdate = Pick<
   ComposerDraft,
-  "modelSelection" | "runtimeMode" | "interactionMode" | "workspaceSelection" | "project"
+  | "modelSelection"
+  | "modelSelectionSelectedAt"
+  | "runtimeMode"
+  | "interactionMode"
+  | "workspaceSelection"
+  | "project"
 >;
 
 const ComposerDraftWorkspaceSelectionSchema = Schema.Struct({
@@ -395,6 +407,7 @@ const ComposerDraftSchema = Schema.Struct({
   attachments: Schema.Array(DraftComposerAttachmentSchema),
   importedShareIds: Schema.optional(Schema.Array(Schema.String)),
   modelSelection: Schema.optional(ModelSelectionSchema),
+  modelSelectionSelectedAt: Schema.optional(Schema.Number),
   runtimeMode: Schema.optional(RuntimeModeSchema),
   interactionMode: Schema.optional(ProviderInteractionModeSchema),
   workspaceSelection: Schema.optional(ComposerDraftWorkspaceSelectionSchema),
@@ -1506,11 +1519,45 @@ export function updateComposerDraftSettings(
   settings: Partial<ComposerDraftSettingsUpdate>,
 ): void {
   updateComposerDrafts((current) => {
+    const existing = normalizeDraft(current[draftKey]);
+    // A new selection carries its own pick time or none; the old one's
+    // never carries over to it.
+    const { modelSelectionSelectedAt: _previousSelectedAt, ...retained } = existing;
     const draft = {
-      ...normalizeDraft(current[draftKey]),
+      ...(settings.modelSelection === undefined ? existing : retained),
       ...settings,
     };
     return withComposerDraft(current, draftKey, draft);
+  });
+}
+
+/**
+ * Drops the draft's account when the server has since moved the thread off
+ * it after a usage limit, so the next message follows the thread instead of
+ * going back to the limited account.
+ */
+export function reconcileComposerDraftProviderFailover(
+  draftKey: string,
+  runs: ReadonlyArray<Pick<OrchestrationV2Run, "requestedAt" | "providerFailover">>,
+): void {
+  updateComposerDrafts((current) => {
+    const existing = current[draftKey];
+    if (
+      existing === undefined ||
+      !isDraftAccountSupersededByFailover({
+        draftInstanceId: existing.modelSelection?.instanceId,
+        draftSelectedAt: existing.modelSelectionSelectedAt,
+        runs,
+      })
+    ) {
+      return current;
+    }
+    const {
+      modelSelection: _modelSelection,
+      modelSelectionSelectedAt: _selectedAt,
+      ...retained
+    } = existing;
+    return withComposerDraft(current, draftKey, retained);
   });
 }
 
@@ -1533,13 +1580,19 @@ export function clearComposerDraftContentState(
     importedShareIds: _importedShareIds,
     context: _context,
     modelSelection,
+    modelSelectionSelectedAt,
     workspaceSelection,
     project: _project,
     ...retained
   } = existing;
   const draft = {
     ...retained,
-    ...(options?.clearModelSelection || modelSelection === undefined ? {} : { modelSelection }),
+    ...(options?.clearModelSelection || modelSelection === undefined
+      ? {}
+      : {
+          modelSelection,
+          ...(modelSelectionSelectedAt === undefined ? {} : { modelSelectionSelectedAt }),
+        }),
     ...(options?.clearWorkspaceSelection || workspaceSelection === undefined
       ? {}
       : { workspaceSelection }),

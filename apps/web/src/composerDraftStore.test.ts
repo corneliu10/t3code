@@ -4,6 +4,7 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
+import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 import {
   defaultInstanceIdForDriver,
@@ -2465,6 +2466,79 @@ describe("composerDraftStore setModelSelection", () => {
     expect(
       draftFor(threadId, TEST_ENVIRONMENT_ID)?.modelSelectionByProvider[CODEX_INSTANCE],
     ).toEqual(modelSelection(CODEX_DRIVER, "gpt-5.3-codex"));
+  });
+});
+
+describe("composerDraftStore provider failover", () => {
+  const threadId = ThreadId.make("thread-failover");
+  const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+  const personal = ProviderInstanceId.make("claude_personal");
+  const pickedAt = Date.parse("2026-10-13T12:00:00.000Z");
+  const failedOverAt = pickedAt + 60_000;
+  // The server moved the thread off `personal` after a usage limit.
+  const runs = [
+    { requestedAt: DateTime.makeUnsafe(pickedAt + 1_000) },
+    {
+      requestedAt: DateTime.makeUnsafe(failedOverAt),
+      providerFailover: { reason: "usage_limit" as const, fromProviderInstanceId: personal },
+    },
+  ];
+
+  beforeEach(() => {
+    resetComposerDraftStore();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(pickedAt);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("drops the account the draft picked once the server moved the thread off it", () => {
+    const store = useComposerDraftStore.getState();
+    store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
+      explicit: true,
+    });
+    store.setPrompt(threadRef, "Next message");
+    vi.setSystemTime(failedOverAt + 5_000);
+
+    store.reconcileProviderFailover(threadRef, runs);
+
+    const draft = draftFor(threadId, TEST_ENVIRONMENT_ID);
+    expect(draft?.activeProvider).toBeNull();
+    expect(draft?.modelSelectionByProvider[personal]).toBeUndefined();
+    expect(draft?.modelSelectionExplicit).toBeUndefined();
+    expect(draft?.prompt).toBe("Next message");
+  });
+
+  it("keeps the account when the user picks it again after the failover", () => {
+    const store = useComposerDraftStore.getState();
+    store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
+      explicit: true,
+    });
+    vi.setSystemTime(failedOverAt + 5_000);
+    store.reconcileProviderFailover(threadRef, runs);
+    store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
+      explicit: true,
+    });
+
+    store.reconcileProviderFailover(threadRef, runs);
+
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.activeProvider).toBe(personal);
+  });
+
+  it("remembers when the account was picked across a reload", () => {
+    const store = useComposerDraftStore.getState();
+    store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
+      explicit: true,
+    });
+
+    const persisted = partializeComposerDraftStoreState(useComposerDraftStore.getState());
+
+    expect(persisted.draftsByThreadKey[scopedThreadKey(threadRef)]).toMatchObject({
+      activeProvider: personal,
+      activeProviderSelectedAt: pickedAt,
+    });
   });
 });
 

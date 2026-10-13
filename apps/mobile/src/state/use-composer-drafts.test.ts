@@ -8,6 +8,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { onTestFinished, vi } from "vite-plus/test";
 
 const composerDraftFileMocks = vi.hoisted(() => {
@@ -193,6 +194,8 @@ import {
   stickyComposerModelSelectionAtom,
   undoComposerDraftMerge,
   undoComposerDraftMergeState,
+  reconcileComposerDraftProviderFailover,
+  updateComposerDraftSettings,
 } from "./use-composer-drafts";
 import { retainComposerAttachmentFileForPreview } from "../lib/composerAttachmentPreviewRetention";
 
@@ -2739,5 +2742,81 @@ describe("mobile composer drafts", () => {
       },
     });
     expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+  });
+});
+
+describe("mobile composer draft after a provider failover", () => {
+  const draftKey = "environment-1:thread-failover";
+  const personal = ProviderInstanceId.make("claude_personal");
+  const pickedAt = Date.parse("2026-10-13T12:00:00.000Z");
+  const failedOverAt = pickedAt + 60_000;
+  const selection = { instanceId: personal, model: "claude-opus-4-6" };
+  // The server moved the thread off `personal` after a usage limit.
+  const runs = [
+    {
+      requestedAt: DateTime.makeUnsafe(failedOverAt),
+      providerFailover: { reason: "usage_limit" as const, fromProviderInstanceId: personal },
+    },
+  ];
+  const pick = () =>
+    updateComposerDraftSettings(draftKey, {
+      modelSelection: selection,
+      modelSelectionSelectedAt: Date.now(),
+    });
+
+  it("drops the account the draft picked once the server moved the thread off it", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(pickedAt);
+    setComposerDraftText(draftKey, "Next message");
+    pick();
+    vi.setSystemTime(failedOverAt + 5_000);
+
+    reconcileComposerDraftProviderFailover(draftKey, runs);
+
+    const draft = getComposerDraftSnapshot(draftKey);
+    expect(draft.modelSelection).toBeUndefined();
+    expect(draft.modelSelectionSelectedAt).toBeUndefined();
+    expect(draft.text).toBe("Next message");
+  });
+
+  it("keeps the account when the user picks it again after the failover", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(pickedAt);
+    pick();
+    vi.setSystemTime(failedOverAt + 5_000);
+    reconcileComposerDraftProviderFailover(draftKey, runs);
+    pick();
+
+    reconcileComposerDraftProviderFailover(draftKey, runs);
+
+    expect(getComposerDraftSnapshot(draftKey).modelSelection).toEqual(selection);
+  });
+
+  it("treats a selection written back without a pick time as older", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(failedOverAt + 5_000);
+    pick();
+    // A bounced message puts its own, earlier selection back.
+    updateComposerDraftSettings(draftKey, { modelSelection: selection });
+
+    reconcileComposerDraftProviderFailover(draftKey, runs);
+
+    expect(getComposerDraftSnapshot(draftKey).modelSelection).toBeUndefined();
+  });
+
+  it("keeps the pick time on disk", () => {
+    const decoded = decodePersistedComposerState({
+      schemaVersion: 1,
+      drafts: {
+        [draftKey]: {
+          text: "",
+          attachments: [],
+          modelSelection: selection,
+          modelSelectionSelectedAt: pickedAt,
+        },
+      },
+    });
+
+    expect(decoded.drafts[draftKey]?.modelSelectionSelectedAt).toBe(pickedAt);
   });
 });

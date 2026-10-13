@@ -76,6 +76,7 @@ import {
   ensureComposerDraftsLoaded,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
+  reconcileComposerDraftProviderFailover,
   removeComposerDraftAttachment,
   scheduleUnusedComposerAttachmentCleanup,
   setComposerDraftText,
@@ -334,6 +335,20 @@ export function useThreadComposerState() {
   const selectedThreadQueueCount = selectedThreadQueuedMessages.length;
   const selectedThread = selectedThreadShell;
   const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
+  // The draft's account wins over the thread's, so once the server moves the
+  // thread off that account after a usage limit, the draft must let go of it.
+  const selectedThreadRuns = selectedThreadProjection?.projection.runs;
+  const selectedDraftInstanceId = selectedDraft?.modelSelection?.instanceId ?? null;
+  useEffect(() => {
+    if (
+      selectedThreadKey === null ||
+      selectedThreadRuns === undefined ||
+      selectedDraftInstanceId === null
+    ) {
+      return;
+    }
+    reconcileComposerDraftProviderFailover(selectedThreadKey, selectedThreadRuns);
+  }, [selectedDraftInstanceId, selectedThreadKey, selectedThreadRuns]);
   const runtimeMode = selectedDraft?.runtimeMode ?? selectedThread?.runtimeMode ?? null;
   const selectedProvider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
     (provider) => provider.instanceId === modelSelection?.instanceId,
@@ -432,7 +447,6 @@ export function useThreadComposerState() {
   // The run can start, or be cancelled from another client, while its message
   // is open in the composer. Leave edit mode rather than saving into a run the
   // server will refuse, and keep whatever was typed if there is room for it.
-  const selectedThreadRuns = selectedThreadProjection?.projection.runs;
   const editedRunId = queuedRunEdit?.runId ?? null;
   useEffect(() => {
     if (selectedThreadKey === null || editedRunId === null || selectedThreadRuns === undefined) {
@@ -1033,6 +1047,7 @@ export function useThreadComposerState() {
       );
       updateComposerDraftSettings(selectedThreadKey, {
         modelSelection: value,
+        modelSelectionSelectedAt: Date.now(),
         ...(provider?.showInteractionModeToggle === false
           ? { interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE }
           : {}),
