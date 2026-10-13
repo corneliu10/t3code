@@ -280,6 +280,29 @@ it.effect("skips an account the thread's project turned off", () =>
   }),
 );
 
+it.effect("skips an account that only a project override turns on", () =>
+  Effect.gen(function* () {
+    const limited = candidate("machine-off");
+    const result = yield* sweepOnce({
+      failover: { enabled: true, chain: [...chain.chain, { instanceId: thirdInstance }] },
+      candidates: [limited],
+      // The registry reports the account off machine-wide.
+      providers: [provider(failedInstance), provider(nextInstance, false), provider(thirdInstance)],
+      settings: {
+        projectSettingsOverrides: {
+          [projectId]: { providerInstances: { [nextInstance]: { enabled: true } } },
+        },
+      },
+    });
+    assert.deepEqual(result.dispatched, [
+      UsageLimitFailoverWorker.limitFailoverCommand(limited, {
+        instanceId: thirdInstance,
+        model: "sonnet",
+      }),
+    ]);
+  }),
+);
+
 it.effect("logs a failed dispatch and moves on to the next thread", () =>
   Effect.gen(function* () {
     const broken = candidate("broken");

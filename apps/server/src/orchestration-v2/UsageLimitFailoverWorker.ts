@@ -55,10 +55,11 @@ const makeSweep = Effect.gen(function* () {
     const failover = settings.usageLimitFailover;
     // Off is the default, so most sweeps stop here without a query.
     if (!failover.enabled || failover.chain.length === 0) return;
-    const candidates = yield* projections.getLimitFailoverCandidates();
+    const now = yield* DateTime.now;
+    const candidates = yield* projections.getLimitFailoverCandidates({ now });
     if (candidates.length === 0) return;
     const providers = yield* providerRegistry.getProviders;
-    const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+    const nowMs = DateTime.toEpochMillis(now);
     for (const candidate of candidates) {
       const choice = chooseFailoverTarget({
         // Thread management refuses an instance the project turned off, with an

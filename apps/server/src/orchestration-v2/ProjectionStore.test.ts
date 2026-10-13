@@ -671,13 +671,17 @@ const limitFailoverCandidates = Effect.gen(function* () {
     return { runId, rootNodeId };
   });
 
-  const limitedThread = Effect.fn("limitedThread")(function* (key: string, resetAt?: string) {
+  const limitedThread = Effect.fn("limitedThread")(function* (
+    key: string,
+    resetAt?: string,
+    completedAt = at(1),
+  ) {
     const thread = yield* createThread(key);
     const run = yield* addRun(thread.id, {
       ordinal: 1,
       instanceId: providerInstanceId,
       status: "failed",
-      completedAt: at(1),
+      completedAt,
       failure: resetAt === undefined ? { class: "usage_limit" } : { class: "usage_limit", resetAt },
     });
     return { thread, ...run };
@@ -796,6 +800,10 @@ const limitFailoverCandidates = Effect.gen(function* () {
   ] as const;
   for (const run of episodeRuns) yield* addRun(episode.id, run);
 
+  // Turning failover on must not continue every thread left limited long ago.
+  const recent = yield* limitedThread("k-recent", undefined, at(-23 * 60));
+  yield* limitedThread("l-stale", undefined, at(-25 * 60));
+
   const expected = (
     thread: typeof noReset.thread,
     runId: RunId,
@@ -811,7 +819,7 @@ const limitFailoverCandidates = Effect.gen(function* () {
     resetAt,
     attemptedInstanceIds,
   });
-  const candidates = (yield* store.getLimitFailoverCandidates()).filter((candidate) =>
+  const candidates = (yield* store.getLimitFailoverCandidates({ now: base })).filter((candidate) =>
     candidate.threadId.startsWith("thread:failover-candidates:"),
   );
   assert.deepEqual(candidates, [
@@ -823,6 +831,7 @@ const limitFailoverCandidates = Effect.gen(function* () {
       instance("latest"),
       instance("tied"),
     ]),
+    expected(recent.thread, recent.runId, providerInstanceId, null, [providerInstanceId]),
   ]);
 });
 

@@ -74,6 +74,7 @@ import {
 import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
@@ -423,11 +424,13 @@ export interface ProjectionStoreV2Shape {
     readonly autoResume: boolean;
     readonly snooze: boolean;
   }) => Effect.Effect<ReadonlyArray<ProjectionLimitRecoveryCandidate>, ProjectionStoreV2Error>;
-  /** Threads ordered by id; every condition the failover gate checks, except the target. */
-  readonly getLimitFailoverCandidates: () => Effect.Effect<
-    ReadonlyArray<ProjectionLimitFailoverCandidate>,
-    ProjectionStoreV2Error
-  >;
+  /**
+   * Threads ordered by id; every condition the failover gate checks, except
+   * the target, for runs limited within `LIMIT_FAILOVER_MAX_AGE` of `now`.
+   */
+  readonly getLimitFailoverCandidates: (options: {
+    readonly now: DateTime.Utc;
+  }) => Effect.Effect<ReadonlyArray<ProjectionLimitFailoverCandidate>, ProjectionStoreV2Error>;
   /** Every candidate, or only `threadId` when a sweep checks one thread. */
   readonly getSettlementCandidates: (
     threadId?: ThreadId,
@@ -1170,6 +1173,18 @@ function nullableStringField(payload: Record<string, unknown>, field: string): s
     return null;
   }
   return typeof value === "string" ? value : String(value);
+}
+
+/**
+ * How recently a run must have stopped on a usage limit to be failed over.
+ * Turning failover on then continues today's limited threads, not every
+ * thread that was ever left on a limit.
+ */
+const LIMIT_FAILOVER_MAX_AGE = Duration.hours(24);
+
+/** The oldest limited run end that failover still acts on. */
+function limitFailoverCutoff(now: DateTime.Utc): DateTime.Utc {
+  return DateTime.subtract(now, { milliseconds: Duration.toMillis(LIMIT_FAILOVER_MAX_AGE) });
 }
 
 /** SQLite's default BINARY order, so the memory store sorts ids as `ORDER BY` does. */
@@ -3617,7 +3632,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     );
 
     const getLimitFailoverCandidates = Effect.fn("ProjectionStore.getLimitFailoverCandidates")(
-      function* () {
+      function* (options: Parameters<ProjectionStoreV2Shape["getLimitFailoverCandidates"]>[0]) {
         // Recovery's lookups and the failover gate's conditions, with no reset
         // time required: a Claude api_retry 429 names none. The worker sends a
         // fixed command id and a refused one is never re-evaluated, so this
@@ -3638,6 +3653,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND json_extract(t.payload_json, '$.archivedAt') IS NULL
             AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'
             AND json_extract(item.payload_json, '$.failure.class') = 'usage_limit'
+            AND julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
+              >= julianday(${DateTime.formatIso(limitFailoverCutoff(options.now))})
             AND NOT EXISTS (
               SELECT 1 FROM orchestration_v2_projection_runtime_requests request
               WHERE request.thread_id = t.thread_id AND request.status = 'pending'
@@ -6304,7 +6321,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               .toSorted((left, right) => left.id.localeCompare(right.id)),
           ),
         ),
-      getLimitFailoverCandidates: () =>
+      getLimitFailoverCandidates: (options) =>
         Ref.get(replayState).pipe(
           Effect.map((state) =>
             [...state.projections.values()]
@@ -6316,6 +6333,8 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                 if (
                   run === null ||
                   failure?.class !== "usage_limit" ||
+                  DateTime.toEpochMillis(run.completedAt ?? thread.updatedAt) <
+                    DateTime.toEpochMillis(limitFailoverCutoff(options.now)) ||
                   thread.deletedAt !== null ||
                   thread.archivedAt !== null ||
                   thread.settledOverride === "settled" ||
