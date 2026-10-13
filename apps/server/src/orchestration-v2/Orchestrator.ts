@@ -4563,9 +4563,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           projection.thread.settledOverride === "settled" ||
           projection.runtimeRequests.some((request) => request.status === "pending")
         ) {
-          // Like a stale auto-resume: an accepted receipt that changes nothing,
-          // so the same command is not retried. The worker sends a new one if
-          // the thread is still limited on its next sweep.
+          // Like a stale auto-resume: an accepted receipt that changes nothing.
+          // The command id is fixed per run and target, so a refused id is
+          // recorded and never re-evaluated. The worker's candidate query
+          // mirrors these conditions, so a refusal only follows a race between
+          // that query and this dispatch.
           yield* emit(
             events,
             command,

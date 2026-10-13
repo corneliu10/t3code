@@ -1,5 +1,8 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
+import * as UsageLimitFailoverWorker from "./UsageLimitFailoverWorker.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -27,6 +30,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -38,6 +42,8 @@ import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -4792,6 +4798,106 @@ it.layer(layerSharedApplicationDataPlaneTest)("shared application data plane", (
   );
 });
 
+/**
+ * A thread whose only run, on the default instance, stopped on a usage
+ * limit, the way the provider leaves it: a failed run with a root error item.
+ */
+const seedUsageLimitedThread = (name: string, reportsReset = true) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make(`failover:${name}`);
+    const projectId = ProjectId.make(`failover:project:${name}`);
+    yield* seedProject({
+      projectId,
+      title: "Failover project",
+      workspaceRoot: process.cwd(),
+      defaultModelSelection: modelSelection,
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`failover:create:${name}`),
+      threadId,
+      projectId,
+      title: "Limited thread",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`failover:message:${name}`),
+      threadId,
+      messageId: MessageId.make(`failover:message:${name}`),
+      text: "Work on this.",
+      attachments: [],
+      dispatchMode: { type: "defer_start" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    const resetAt = yield* limitRun(threadId, run, `${name}:first`, reportsReset);
+    return { threadId, run, resetAt };
+  });
+
+/**
+ * Ends a run on a usage limit that resets in a minute. Without `reportsReset`
+ * the failure names no reset time, as a Claude api_retry 429 does.
+ */
+const limitRun = (threadId: ThreadId, run: OrchestrationV2Run, key: string, reportsReset = true) =>
+  Effect.gen(function* () {
+    const events = yield* EventSink.EventSinkV2;
+    const now = yield* DateTime.now;
+    const resetAt = DateTime.formatIso(DateTime.add(now, { minutes: 1 }));
+    yield* events.write({
+      commandId: CommandId.make(`failover:failure:${key}`),
+      events: [
+        {
+          id: EventId.make(`failover:run:${key}`),
+          type: "run.updated",
+          threadId,
+          occurredAt: now,
+          payload: { ...run, status: "failed", completedAt: now },
+        },
+        {
+          id: EventId.make(`failover:error:${key}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`failover:error:${key}`),
+            type: "error",
+            threadId,
+            runId: run.id,
+            nodeId: run.rootNodeId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 100 + run.ordinal,
+            status: "failed",
+            title: "Usage limit reached",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            failure: {
+              class: "usage_limit",
+              message: "Plan limit reached.",
+              code: "usageLimitExceeded",
+              retryable: null,
+              ...(reportsReset ? { resetAt } : {}),
+            },
+          },
+        },
+      ],
+    });
+    return resetAt;
+  });
+
 it.layer(layerTest)("usage-limit recovery", (it) => {
   it.effect.each(["interrupted", "usage_limit"] as const)(
     "manually resumes an %s run ahead of its queued message only once",
@@ -5453,103 +5559,6 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     }),
   );
 
-  /**
-   * A thread whose only run, on the default instance, stopped on a usage
-   * limit, the way the provider leaves it: a failed run with a root error item.
-   */
-  const seedUsageLimitedThread = (name: string) =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const threadId = ThreadId.make(`failover:${name}`);
-      const projectId = ProjectId.make(`failover:project:${name}`);
-      yield* seedProject({
-        projectId,
-        title: "Failover project",
-        workspaceRoot: process.cwd(),
-        defaultModelSelection: modelSelection,
-        createdAt: DateTime.formatIso(yield* DateTime.now),
-      });
-      yield* orchestrator.dispatch({
-        type: "thread.create",
-        commandId: CommandId.make(`failover:create:${name}`),
-        threadId,
-        projectId,
-        title: "Limited thread",
-        modelSelection,
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        branch: null,
-        worktreePath: null,
-        createdBy: "user",
-        creationSource: "web",
-      });
-      yield* orchestrator.dispatch({
-        type: "message.dispatch",
-        commandId: CommandId.make(`failover:message:${name}`),
-        threadId,
-        messageId: MessageId.make(`failover:message:${name}`),
-        text: "Work on this.",
-        attachments: [],
-        dispatchMode: { type: "defer_start" },
-        createdBy: "user",
-        creationSource: "web",
-      });
-      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
-      const resetAt = yield* limitRun(threadId, run, `${name}:first`);
-      return { threadId, run, resetAt };
-    });
-
-  /** Ends a run on a usage limit that resets in a minute. */
-  const limitRun = (threadId: ThreadId, run: OrchestrationV2Run, key: string) =>
-    Effect.gen(function* () {
-      const events = yield* EventSink.EventSinkV2;
-      const now = yield* DateTime.now;
-      const resetAt = DateTime.formatIso(DateTime.add(now, { minutes: 1 }));
-      yield* events.write({
-        commandId: CommandId.make(`failover:failure:${key}`),
-        events: [
-          {
-            id: EventId.make(`failover:run:${key}`),
-            type: "run.updated",
-            threadId,
-            occurredAt: now,
-            payload: { ...run, status: "failed", completedAt: now },
-          },
-          {
-            id: EventId.make(`failover:error:${key}`),
-            type: "turn-item.updated",
-            threadId,
-            occurredAt: now,
-            payload: {
-              id: TurnItemId.make(`failover:error:${key}`),
-              type: "error",
-              threadId,
-              runId: run.id,
-              nodeId: run.rootNodeId,
-              providerThreadId: null,
-              providerTurnId: null,
-              nativeItemRef: null,
-              parentItemId: null,
-              ordinal: 100 + run.ordinal,
-              status: "failed",
-              title: "Usage limit reached",
-              startedAt: now,
-              completedAt: now,
-              updatedAt: now,
-              failure: {
-                class: "usage_limit",
-                message: "Plan limit reached.",
-                code: "usageLimitExceeded",
-                retryable: null,
-                resetAt,
-              },
-            },
-          },
-        ],
-      });
-      return resetAt;
-    });
-
   /** What the failover worker sends to continue a limited run on another account. */
   const failoverCommand = (input: {
     readonly key: string;
@@ -5804,6 +5813,128 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
       const after = yield* orchestrator.getThreadProjection(threadId);
       assert.lengthOf(after.runs, 3);
       assert.equal(after.thread.providerInstanceId, modelSelection.instanceId);
+    }),
+  );
+});
+
+/**
+ * The runtime with the alternate account switched on and in the failover
+ * chain, so thread management and the failover worker read the same settings.
+ */
+const layerFailoverWorkerTest = Layer.mergeAll(
+  RuntimeLayer.layer,
+  RuntimeLayer.layerEventSink,
+  ProjectStore.layer,
+  ProjectionStore.layer,
+  EffectOutbox.layer,
+  ThreadCommandExecutor.layer,
+).pipe(
+  Layer.provide(McpSessionRegistryTestkit.layer),
+  Layer.provide(McpProviderSessions.layer),
+  Layer.provide(SqlitePersistence.layerMemory),
+  Layer.provide(layerCheckpointStoreTest),
+  Layer.provide(layerServerConfig),
+  Layer.provideMerge(
+    ServerSettings.layerTest({
+      providerInstances: { [alternateInstanceId]: { driver: "codex", enabled: true } },
+      usageLimitFailover: {
+        enabled: true,
+        chain: [{ instanceId: modelSelection.instanceId }, { instanceId: alternateInstanceId }],
+      },
+    }),
+  ),
+  Layer.provide(layerTestProviderInstanceRegistry),
+  Layer.provide(layerGitWorkflowTest),
+  Layer.provide(layerProjectServiceTest),
+  Layer.provide(layerPlatformTest),
+);
+
+const decodeServerProvider = Schema.decodeUnknownSync(ServerProvider);
+const codexProvider = (instanceId: ProviderInstanceId) =>
+  decodeServerProvider({
+    instanceId,
+    driver,
+    enabled: true,
+    installed: true,
+    version: "1.0.0",
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: "2026-10-13T11:59:00.000Z",
+    models: [
+      {
+        slug: modelSelection.model,
+        name: modelSelection.model,
+        isCustom: false,
+        isDefault: true,
+        capabilities: null,
+      },
+    ],
+    slashCommands: [],
+    skills: [],
+  });
+
+/** Builds the failover worker on the runtime and runs the sweep it registers, once. */
+const sweepFailoverOnce = Effect.gen(function* () {
+  const sources = yield* Ref.make<ReadonlyArray<Effect.Effect<void>>>([]);
+  const layerWorker = UsageLimitFailoverWorker.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed([
+            codexProvider(modelSelection.instanceId),
+            codexProvider(alternateInstanceId),
+          ]),
+        }),
+        Layer.succeed(
+          Scheduler.Scheduler,
+          Scheduler.Scheduler.of({
+            register: <E, R>(_name: string, runDueWork: Effect.Effect<void, E, R>) =>
+              Effect.gen(function* () {
+                const context = yield* Effect.context<R>();
+                yield* Ref.update(sources, (all) => [
+                  ...all,
+                  runDueWork.pipe(Effect.provideContext(context), Effect.orDie),
+                ]);
+              }),
+          }),
+        ),
+      ),
+    ),
+  );
+  yield* Effect.gen(function* () {
+    for (const run of yield* Ref.get(sources)) yield* run;
+  }).pipe(Effect.provide(layerWorker));
+});
+
+it.layer(layerFailoverWorkerTest)("usage-limit failover worker", (it) => {
+  it.effect("continues a limit that names no reset time on the next account", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, run } = yield* seedUsageLimitedThread("worker", false);
+
+      yield* sweepFailoverOnce;
+
+      // The gate accepted the worker's command: a run on the next account.
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(after.runs, 2);
+      const continuation = after.runs[1]!;
+      assert.equal(continuation.providerInstanceId, alternateInstanceId);
+      assert.deepEqual(continuation.providerFailover, {
+        reason: "usage_limit",
+        fromProviderInstanceId: modelSelection.instanceId,
+      });
+      assert.equal(after.thread.providerInstanceId, alternateInstanceId);
+      assert.isTrue(
+        after.messages.some(
+          (message) =>
+            message.id ===
+            MessageId.make(`limit-failover:${threadId}:${run.id}:${alternateInstanceId}`),
+        ),
+      );
+
+      // The continuation is now the latest run, so the next sweep sends nothing.
+      yield* sweepFailoverOnce;
+      assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 2);
     }),
   );
 });

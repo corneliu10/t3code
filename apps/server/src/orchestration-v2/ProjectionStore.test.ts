@@ -548,6 +548,292 @@ it.effect("memory shell snapshots scope to one project", () =>
   ),
 );
 
+/**
+ * Threads the failover worker must and must not pick up, written only through
+ * `apply` so the SQL and memory stores answer the same question.
+ */
+const limitFailoverCandidates = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const base = yield* DateTime.now;
+  const at = (minutes: number) => DateTime.add(base, { minutes });
+  const projectId = ProjectId.make("project:failover-candidates");
+  const instance = (name: string) => ProviderInstanceId.make(`codex_${name}`);
+
+  const createThread = Effect.fn("createThread")(function* (key: string) {
+    const threadId = ThreadId.make(`thread:failover-candidates:${key}`);
+    const thread = {
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      id: threadId,
+      projectId,
+      title: "Failover candidate",
+      providerInstanceId,
+      modelSelection,
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdAt: base,
+      updatedAt: base,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    };
+    yield* store.apply({
+      id: EventId.make(`event:failover-candidates:${key}:thread`),
+      type: "thread.created",
+      threadId,
+      occurredAt: base,
+      payload: thread,
+    });
+    return thread;
+  });
+
+  const addRun = Effect.fn("addRun")(function* (
+    threadId: ThreadId,
+    input: {
+      readonly ordinal: number;
+      readonly instanceId: ProviderInstanceId;
+      readonly status: "failed" | "completed" | "queued";
+      readonly completedAt: DateTime.Utc | null;
+      readonly failure?: {
+        readonly class: "usage_limit" | "provider_error";
+        readonly resetAt?: string;
+      };
+    },
+  ) {
+    const runId = RunId.make(`${threadId}:run:${input.ordinal}`);
+    const rootNodeId = NodeId.make(`${threadId}:node:${input.ordinal}`);
+    yield* store.apply({
+      id: EventId.make(`${threadId}:run-event:${input.ordinal}`),
+      type: "run.created",
+      threadId,
+      runId,
+      nodeId: rootNodeId,
+      driver,
+      providerInstanceId: input.instanceId,
+      occurredAt: base,
+      payload: {
+        id: runId,
+        threadId,
+        ordinal: input.ordinal,
+        providerInstanceId: input.instanceId,
+        modelSelection: { ...modelSelection, instanceId: input.instanceId },
+        providerThreadId: null,
+        userMessageId: MessageId.make(`${threadId}:message:${input.ordinal}`),
+        rootNodeId,
+        activeAttemptId: null,
+        status: input.status,
+        requestedAt: base,
+        startedAt: input.status === "queued" ? null : base,
+        completedAt: input.completedAt,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    });
+    if (input.failure !== undefined) {
+      yield* store.apply({
+        id: EventId.make(`${threadId}:error-event:${input.ordinal}`),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: base,
+        payload: {
+          id: TurnItemId.make(`${threadId}:error:${input.ordinal}`),
+          threadId,
+          runId,
+          nodeId: rootNodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: input.ordinal,
+          status: "failed",
+          title: "Run failed",
+          startedAt: base,
+          completedAt: input.completedAt,
+          updatedAt: input.completedAt ?? base,
+          type: "error",
+          failure: {
+            class: input.failure.class,
+            message: "Plan limit reached.",
+            code: null,
+            retryable: null,
+            ...(input.failure.resetAt === undefined ? {} : { resetAt: input.failure.resetAt }),
+          },
+        },
+      });
+    }
+    return { runId, rootNodeId };
+  });
+
+  const limitedThread = Effect.fn("limitedThread")(function* (key: string, resetAt?: string) {
+    const thread = yield* createThread(key);
+    const run = yield* addRun(thread.id, {
+      ordinal: 1,
+      instanceId: providerInstanceId,
+      status: "failed",
+      completedAt: at(1),
+      failure: resetAt === undefined ? { class: "usage_limit" } : { class: "usage_limit", resetAt },
+    });
+    return { thread, ...run };
+  });
+
+  // A Claude api_retry 429 names no reset time; failover must not wait for one.
+  const noReset = yield* limitedThread("a-no-reset");
+  const withReset = yield* limitedThread("b-with-reset", "2099-01-01T00:00:00.000Z");
+
+  const completed = yield* createThread("c-completed");
+  yield* addRun(completed.id, {
+    ordinal: 1,
+    instanceId: providerInstanceId,
+    status: "completed",
+    completedAt: at(1),
+  });
+  const otherFailure = yield* createThread("d-other-failure");
+  yield* addRun(otherFailure.id, {
+    ordinal: 1,
+    instanceId: providerInstanceId,
+    status: "failed",
+    completedAt: at(1),
+    failure: { class: "provider_error" },
+  });
+  for (const [key, patch] of [
+    ["e-archived", { archivedAt: at(2) }],
+    ["f-settled", { settledOverride: "settled" as const, settledAt: at(2) }],
+    ["g-deleted", { deletedAt: at(2) }],
+  ] as const) {
+    const { thread } = yield* limitedThread(key);
+    yield* store.apply({
+      id: EventId.make(`event:failover-candidates:${key}:patch`),
+      type: "thread.metadata-updated",
+      threadId: thread.id,
+      occurredAt: at(2),
+      payload: { ...thread, ...patch, updatedAt: at(2) },
+    });
+  }
+  const pending = yield* limitedThread("h-pending-request");
+  yield* store.apply({
+    id: EventId.make("event:failover-candidates:pending-request"),
+    type: "runtime-request.updated",
+    threadId: pending.thread.id,
+    nodeId: pending.rootNodeId,
+    occurredAt: at(2),
+    payload: {
+      id: RuntimeRequestId.make("failover-candidates:pending-request"),
+      nodeId: pending.rootNodeId,
+      providerTurnId: null,
+      nativeRequestRef: null,
+      kind: "user_input",
+      status: "pending",
+      responseCapability: { type: "message" },
+      createdAt: at(2),
+      resolvedAt: null,
+    },
+  });
+  // A newer, different session error replaces the limit as the thread's error.
+  const sessionError = yield* limitedThread("i-session-error");
+  yield* store.apply({
+    id: EventId.make("event:failover-candidates:session-error"),
+    type: "provider-session.attached",
+    threadId: sessionError.thread.id,
+    driver,
+    providerInstanceId,
+    occurredAt: at(2),
+    payload: {
+      id: ProviderSessionId.make("session:failover-candidates:session-error"),
+      driver,
+      providerInstanceId,
+      status: "error",
+      cwd: "/workspace",
+      model: modelSelection.model,
+      capabilities: CodexProviderCapabilitiesV2,
+      createdAt: at(2),
+      updatedAt: at(2),
+      lastError: "Provider process exited.",
+    },
+  });
+
+  // The episode starts after the last completed run. A run that ended at the
+  // same moment but was submitted later belongs to it; a later failure that
+  // was not a usage limit does not count as an attempt.
+  const episode = yield* createThread("j-episode");
+  const episodeRuns = [
+    {
+      ordinal: 1,
+      instanceId: instance("before"),
+      status: "failed",
+      completedAt: at(1),
+      failure: { class: "usage_limit" },
+    },
+    { ordinal: 2, instanceId: providerInstanceId, status: "completed", completedAt: at(2) },
+    {
+      ordinal: 3,
+      instanceId: instance("tied"),
+      status: "failed",
+      completedAt: at(2),
+      failure: { class: "usage_limit" },
+    },
+    {
+      ordinal: 4,
+      instanceId: instance("broken"),
+      status: "failed",
+      completedAt: at(3),
+      failure: { class: "provider_error" },
+    },
+    {
+      ordinal: 5,
+      instanceId: instance("latest"),
+      status: "failed",
+      completedAt: at(4),
+      failure: { class: "usage_limit" },
+    },
+    { ordinal: 6, instanceId: providerInstanceId, status: "queued", completedAt: null },
+  ] as const;
+  for (const run of episodeRuns) yield* addRun(episode.id, run);
+
+  const expected = (
+    thread: typeof noReset.thread,
+    runId: RunId,
+    runProviderInstanceId: ProviderInstanceId,
+    resetAt: string | null,
+    attemptedInstanceIds: ReadonlyArray<ProviderInstanceId>,
+  ): ProjectionStore.ProjectionLimitFailoverCandidate => ({
+    threadId: thread.id,
+    projectId,
+    runId,
+    runProviderInstanceId,
+    modelSelection,
+    resetAt,
+    attemptedInstanceIds,
+  });
+  const candidates = (yield* store.getLimitFailoverCandidates()).filter((candidate) =>
+    candidate.threadId.startsWith("thread:failover-candidates:"),
+  );
+  assert.deepEqual(candidates, [
+    expected(noReset.thread, noReset.runId, providerInstanceId, null, [providerInstanceId]),
+    expected(withReset.thread, withReset.runId, providerInstanceId, "2099-01-01T00:00:00.000Z", [
+      providerInstanceId,
+    ]),
+    expected(episode, RunId.make(`${episode.id}:run:5`), instance("latest"), null, [
+      instance("latest"),
+      instance("tied"),
+    ]),
+  ]);
+});
+
+it.effect("SQL failover candidates mirror the failover gate", () =>
+  limitFailoverCandidates.pipe(Effect.provide(layerTest)),
+);
+
+it.effect("memory failover candidates mirror the failover gate", () =>
+  limitFailoverCandidates.pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
 it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect(
     "SQL recovery selects unfinished runless native subagents",
