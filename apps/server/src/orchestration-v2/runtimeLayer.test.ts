@@ -5452,6 +5452,360 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
       }
     }),
   );
+
+  /**
+   * A thread whose only run, on the default instance, stopped on a usage
+   * limit, the way the provider leaves it: a failed run with a root error item.
+   */
+  const seedUsageLimitedThread = (name: string) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make(`failover:${name}`);
+      const projectId = ProjectId.make(`failover:project:${name}`);
+      yield* seedProject({
+        projectId,
+        title: "Failover project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        createdAt: DateTime.formatIso(yield* DateTime.now),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`failover:create:${name}`),
+        threadId,
+        projectId,
+        title: "Limited thread",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`failover:message:${name}`),
+        threadId,
+        messageId: MessageId.make(`failover:message:${name}`),
+        text: "Work on this.",
+        attachments: [],
+        dispatchMode: { type: "defer_start" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      const resetAt = yield* limitRun(threadId, run, `${name}:first`);
+      return { threadId, run, resetAt };
+    });
+
+  /** Ends a run on a usage limit that resets in a minute. */
+  const limitRun = (threadId: ThreadId, run: OrchestrationV2Run, key: string) =>
+    Effect.gen(function* () {
+      const events = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      const resetAt = DateTime.formatIso(DateTime.add(now, { minutes: 1 }));
+      yield* events.write({
+        commandId: CommandId.make(`failover:failure:${key}`),
+        events: [
+          {
+            id: EventId.make(`failover:run:${key}`),
+            type: "run.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...run, status: "failed", completedAt: now },
+          },
+          {
+            id: EventId.make(`failover:error:${key}`),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make(`failover:error:${key}`),
+              type: "error",
+              threadId,
+              runId: run.id,
+              nodeId: run.rootNodeId,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 100 + run.ordinal,
+              status: "failed",
+              title: "Usage limit reached",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              failure: {
+                class: "usage_limit",
+                message: "Plan limit reached.",
+                code: "usageLimitExceeded",
+                retryable: null,
+                resetAt,
+              },
+            },
+          },
+        ],
+      });
+      return resetAt;
+    });
+
+  /** What the failover worker sends to continue a limited run on another account. */
+  const failoverCommand = (input: {
+    readonly key: string;
+    readonly threadId: ThreadId;
+    readonly continuationOf: RunId | undefined;
+    readonly from: ProviderInstanceId;
+    readonly to: ProviderInstanceId;
+  }) => ({
+    type: "message.dispatch" as const,
+    commandId: CommandId.make(`failover:dispatch:${input.key}`),
+    messageId: MessageId.make(`failover:dispatch:${input.key}`),
+    threadId: input.threadId,
+    modelSelection: { instanceId: input.to, model: modelSelection.model },
+    ...(input.continuationOf === undefined
+      ? {}
+      : { usageLimitContinuationOfRunId: input.continuationOf }),
+    providerFailover: { reason: "usage_limit" as const, fromProviderInstanceId: input.from },
+    text: "Continue where you left off.",
+    attachments: [],
+    dispatchMode: { type: "start_immediately" as const },
+    createdBy: "user" as const,
+    creationSource: "server" as const,
+  });
+
+  it.effect("continues a usage-limited run on another account", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, run } = yield* seedUsageLimitedThread("accept");
+      const command = failoverCommand({
+        key: "accept",
+        threadId,
+        continuationOf: run.id,
+        from: modelSelection.instanceId,
+        to: alternateInstanceId,
+      });
+
+      const result = yield* orchestrator.dispatch(command);
+
+      assert.include(
+        result.storedEvents.map((stored) => stored.event.type),
+        "thread.provider-switched",
+      );
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(after.runs, 2);
+      const continuation = after.runs[1]!;
+      assert.equal(continuation.providerInstanceId, alternateInstanceId);
+      assert.deepEqual(continuation.providerFailover, command.providerFailover);
+      assert.equal(after.thread.providerInstanceId, alternateInstanceId);
+      assert.equal(after.thread.modelSelection.instanceId, alternateInstanceId);
+    }),
+  );
+
+  it.effect("clears limit recovery and its snooze when a failover is accepted", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, run, resetAt } = yield* seedUsageLimitedThread("clears-recovery");
+      const shell = (yield* orchestrator.getShellSnapshot()).threads.find(
+        (thread) => thread.id === threadId,
+      )!;
+      const now = yield* DateTime.now;
+      yield* orchestrator.dispatch(
+        limitRecoveryCommand(shell, true, DateTime.toEpochMillis(now), true)!,
+      );
+      const armed = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(armed.thread.limitRecovery?.runId, run.id);
+      assert.isTrue(armed.thread.limitRecovery?.autoResume);
+      assert.equal(DateTime.toEpochMillis(armed.thread.snoozedUntil!), Date.parse(resetAt));
+
+      const result = yield* orchestrator.dispatch(
+        failoverCommand({
+          key: "clears-recovery",
+          threadId,
+          continuationOf: run.id,
+          from: modelSelection.instanceId,
+          to: alternateInstanceId,
+        }),
+      );
+
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(after.runs, 2);
+      assert.isNull(after.thread.limitRecovery ?? null);
+      assert.isNull(after.thread.snoozedUntil ?? null);
+      // One commit: the clear and the new run land under the same command.
+      const types = result.storedEvents.map((stored) => stored.event.type);
+      assert.include(types, "run.created");
+      assert.isTrue(
+        result.storedEvents.some(
+          (stored) =>
+            "payload" in stored.event &&
+            stored.event.type.startsWith("thread.") &&
+            (stored.event.payload as { limitRecovery?: unknown }).limitRecovery === null,
+        ),
+      );
+      // The old account's scheduled resume no longer has anything to continue.
+      const shellAfter = (yield* orchestrator.getShellSnapshot()).threads.find(
+        (thread) => thread.id === threadId,
+      )!;
+      yield* TestClock.adjust("1 minute");
+      assert.isNull(
+        limitRecoveryCommand(shellAfter, true, DateTime.toEpochMillis(yield* DateTime.now)),
+      );
+    }),
+  );
+
+  it.effect.each([
+    "same-instance",
+    "wrong-source",
+    "stale",
+    "missing-continuation",
+    "not-limited",
+    "archived",
+    "settled",
+    "pending-request",
+  ] as const)("refuses a usage-limit failover when %s", (scenario) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const { threadId, run } = yield* seedUsageLimitedThread(`refuse:${scenario}`);
+      if (scenario === "not-limited") {
+        const now = yield* DateTime.now;
+        const failed = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make("failover:refuse:not-limited:completed"),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...failed, status: "completed", completedAt: now },
+            },
+          ],
+        });
+      }
+      if (scenario === "archived")
+        yield* orchestrator.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make(`failover:refuse:archive`),
+          threadId,
+        });
+      if (scenario === "settled")
+        yield* orchestrator.dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make(`failover:refuse:settle`),
+          threadId,
+        });
+      if (scenario === "pending-request") {
+        const now = yield* DateTime.now;
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make("failover:refuse:pending-request"),
+              type: "runtime-request.updated",
+              threadId,
+              nodeId: run.rootNodeId!,
+              occurredAt: now,
+              payload: {
+                id: RuntimeRequestId.make("failover:refuse:pending-request"),
+                nodeId: run.rootNodeId!,
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "user_input",
+                status: "pending",
+                responseCapability: { type: "message" },
+                createdAt: now,
+                resolvedAt: null,
+              },
+            },
+          ],
+        });
+      }
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const command = failoverCommand({
+        key: `refuse:${scenario}`,
+        threadId,
+        continuationOf:
+          scenario === "missing-continuation"
+            ? undefined
+            : scenario === "stale"
+              ? RunId.make("failover:refuse:stale-run")
+              : run.id,
+        from: scenario === "wrong-source" ? alternateInstanceId : modelSelection.instanceId,
+        to: scenario === "same-instance" ? modelSelection.instanceId : alternateInstanceId,
+      });
+
+      // A refusal is recorded, not thrown, so the same command is not retried.
+      yield* orchestrator.dispatch(command);
+      yield* orchestrator.dispatch(command);
+
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(after.runs, before.runs.length);
+      assert.lengthOf(after.messages, before.messages.length);
+      assert.equal(after.thread.providerInstanceId, modelSelection.instanceId);
+      assert.deepEqual(after.thread.modelSelection, before.thread.modelSelection);
+    }),
+  );
+
+  it.effect("refuses a failover onto an account the limit episode already tried", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, run } = yield* seedUsageLimitedThread("attempted");
+      yield* orchestrator.dispatch(
+        failoverCommand({
+          key: "attempted:first",
+          threadId,
+          continuationOf: run.id,
+          from: modelSelection.instanceId,
+          to: alternateInstanceId,
+        }),
+      );
+      const continuation = (yield* orchestrator.getThreadProjection(threadId)).runs[1]!;
+      assert.equal(continuation.providerInstanceId, alternateInstanceId);
+      yield* limitRun(threadId, continuation, "attempted:second");
+
+      // Back to the first account: it is still limited in this episode.
+      yield* orchestrator.dispatch(
+        failoverCommand({
+          key: "attempted:back",
+          threadId,
+          continuationOf: continuation.id,
+          from: alternateInstanceId,
+          to: modelSelection.instanceId,
+        }),
+      );
+      assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 2);
+
+      // The user moves back by hand and hits the limit again; the episode has
+      // still tried the alternate account, so failover does not return to it.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("failover:attempted:manual"),
+        messageId: MessageId.make("failover:attempted:manual"),
+        threadId,
+        modelSelection,
+        text: "Try the first account again.",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const manual = (yield* orchestrator.getThreadProjection(threadId)).runs[2]!;
+      assert.equal(manual.providerInstanceId, modelSelection.instanceId);
+      yield* limitRun(threadId, manual, "attempted:third");
+      yield* orchestrator.dispatch(
+        failoverCommand({
+          key: "attempted:again",
+          threadId,
+          continuationOf: manual.id,
+          from: modelSelection.instanceId,
+          to: alternateInstanceId,
+        }),
+      );
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(after.runs, 3);
+      assert.equal(after.thread.providerInstanceId, modelSelection.instanceId);
+    }),
+  );
 });
 
 const queueResumeDisabledInstanceProjectId = ProjectId.make(

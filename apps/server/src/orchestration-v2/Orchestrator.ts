@@ -8,6 +8,7 @@ import {
   latestRootProviderFailure,
   runRanAfter,
   usageLimitBlockedRun,
+  usageLimitEpisodeAttemptedInstanceIds,
 } from "@t3tools/shared/orchestrationV2ThreadError";
 import { threadPullRequestsOf } from "@t3tools/shared/threadPullRequests";
 import {
@@ -4537,7 +4538,68 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           });
         }
       }
-      if (command.usageLimitContinuationOfRunId !== undefined) {
+      if (command.providerFailover?.reason === "usage_limit") {
+        // A failover continues the limited run on another account. It reads no
+        // settings: the worker that sends it owns the on/off switch, and a
+        // client could already switch accounts by hand.
+        const run = usageLimitBlockedRun(projection.runs, projection.turnItems, null);
+        const failure = latestRootProviderFailure(run, projection.turnItems);
+        const targetInstanceId = command.modelSelection?.instanceId;
+        const attempted = usageLimitEpisodeAttemptedInstanceIds(
+          projection.runs,
+          projection.turnItems,
+        );
+        if (
+          command.usageLimitContinuationOfRunId === undefined ||
+          run?.id !== command.usageLimitContinuationOfRunId ||
+          failure?.class !== "usage_limit" ||
+          threadShellFromProjection(projection).lastErrorClass !== "usage_limit" ||
+          targetInstanceId === undefined ||
+          targetInstanceId === run.providerInstanceId ||
+          attempted.has(targetInstanceId) ||
+          command.providerFailover.fromProviderInstanceId !== run.providerInstanceId ||
+          projection.thread.archivedAt !== null ||
+          projection.thread.deletedAt !== null ||
+          projection.thread.settledOverride === "settled" ||
+          projection.runtimeRequests.some((request) => request.status === "pending")
+        ) {
+          // Like a stale auto-resume: an accepted receipt that changes nothing,
+          // so the same command is not retried. The worker sends a new one if
+          // the thread is still limited on its next sweep.
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: command.threadId,
+            occurredAt: yield* DateTime.now,
+            payload: projection.thread,
+          });
+          return;
+        }
+        // The run on the other account replaces any "resume at reset" the
+        // recovery worker armed for the old one, and the snooze waiting for it.
+        if (projection.thread.limitRecovery != null || projection.thread.snoozedUntil != null) {
+          const now = yield* DateTime.now;
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: command.threadId,
+            providerInstanceId: projection.thread.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              ...projection.thread,
+              limitRecovery: null,
+              snoozedUntil: null,
+              snoozedAt: null,
+              updatedAt: now,
+            },
+          });
+          projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+        }
+      } else if (command.usageLimitContinuationOfRunId !== undefined) {
         const run = usageLimitBlockedRun(projection.runs, projection.turnItems, null);
         const failure = latestRootProviderFailure(run, projection.turnItems);
         const recovery = projection.thread.limitRecovery;
@@ -5054,6 +5116,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.restartContinuationOfRunId === undefined
             ? {}
             : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+          ...(command.providerFailover === undefined
+            ? {}
+            : { providerFailover: command.providerFailover }),
           ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -5394,6 +5459,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.restartContinuationOfRunId === undefined
             ? {}
             : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+          ...(command.providerFailover === undefined
+            ? {}
+            : { providerFailover: command.providerFailover }),
           ...(dispatchMode.type === "defer_start" && dispatchMode.workspaceStrategy !== undefined
             ? { workspacePreparation: dispatchMode.workspaceStrategy }
             : {}),
@@ -6091,6 +6159,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.restartContinuationOfRunId === undefined
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+        ...(command.providerFailover === undefined
+          ? {}
+          : { providerFailover: command.providerFailover }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
         ...wakeWorkStartedAt(projection.runs, command),
       };
