@@ -2051,6 +2051,7 @@ function normalizePersistedDraftsByThreadId(
     const legacyDraftCandidate = draftValue as LegacyPersistedComposerThreadDraftState;
     let modelSelectionByProvider: Partial<Record<ProviderInstanceId, ModelSelection>> = {};
     let activeProvider: ProviderInstanceId | null = null;
+    let activeProviderSelectedAt: number | undefined = undefined;
     let modelSelectionExplicit: true | undefined = undefined;
 
     if (
@@ -2062,6 +2063,11 @@ function normalizePersistedDraftsByThreadId(
         Record<ProviderInstanceId, ModelSelection>
       >;
       activeProvider = normalizeProviderInstanceId(draftCandidate.activeProvider);
+      activeProviderSelectedAt =
+        typeof draftCandidate.activeProviderSelectedAt === "number" &&
+        Number.isFinite(draftCandidate.activeProviderSelectedAt)
+          ? draftCandidate.activeProviderSelectedAt
+          : undefined;
       modelSelectionExplicit = draftCandidate.modelSelectionExplicit === true ? true : undefined;
     } else {
       // v2 or legacy format: migrate
@@ -2135,6 +2141,9 @@ function normalizePersistedDraftsByThreadId(
         ? {
             modelSelectionByProvider: compactModelSelectionByProvider(modelSelectionByProvider),
             activeProvider,
+            ...(activeProvider !== null && activeProviderSelectedAt !== undefined
+              ? { activeProviderSelectedAt }
+              : {}),
             ...(modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
           }
         : {}),

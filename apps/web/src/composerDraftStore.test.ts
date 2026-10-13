@@ -2527,18 +2527,92 @@ describe("composerDraftStore provider failover", () => {
     expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.activeProvider).toBe(personal);
   });
 
+  // What the page does on a reload: the store is written as JSON and the
+  // persist `merge` rebuilds every draft field by field.
+  function reloadDrafts() {
+    const merge = useComposerDraftStore.persist.getOptions().merge!;
+    return merge(
+      JSON.parse(
+        JSON.stringify(partializeComposerDraftStoreState(useComposerDraftStore.getState())),
+      ),
+      useComposerDraftStore.getInitialState(),
+    );
+  }
+
   it("remembers when the account was picked across a reload", () => {
     const store = useComposerDraftStore.getState();
     store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
       explicit: true,
     });
 
-    const persisted = partializeComposerDraftStoreState(useComposerDraftStore.getState());
+    const draft = reloadDrafts().draftsByThreadKey[scopedThreadKey(threadRef)];
 
-    expect(persisted.draftsByThreadKey[scopedThreadKey(threadRef)]).toMatchObject({
-      activeProvider: personal,
-      activeProviderSelectedAt: pickedAt,
+    expect(draft?.activeProvider).toBe(personal);
+    expect(draft?.activeProviderSelectedAt).toBe(pickedAt);
+  });
+
+  it("keeps an account picked again after the failover across a reload", () => {
+    const store = useComposerDraftStore.getState();
+    store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
+      explicit: true,
     });
+    store.setPrompt(threadRef, "Next message");
+    vi.setSystemTime(failedOverAt + 5_000);
+    store.reconcileProviderFailover(threadRef, runs);
+    store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
+      explicit: true,
+    });
+    useComposerDraftStore.setState(reloadDrafts());
+
+    useComposerDraftStore.getState().reconcileProviderFailover(threadRef, runs);
+
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.activeProvider).toBe(personal);
+  });
+
+  it("still drops an account picked before the failover after a reload", () => {
+    const store = useComposerDraftStore.getState();
+    store.setModelSelection(threadRef, createModelSelection(personal, "claude-opus-4-6"), {
+      explicit: true,
+    });
+    store.setPrompt(threadRef, "Next message");
+    useComposerDraftStore.setState(reloadDrafts());
+    vi.setSystemTime(failedOverAt + 5_000);
+
+    useComposerDraftStore.getState().reconcileProviderFailover(threadRef, runs);
+
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.activeProvider).toBeNull();
+  });
+
+  it.each([
+    ["missing", { activeProviderSelectedAt: undefined }],
+    ["null", { activeProviderSelectedAt: null }],
+    ["NaN", { activeProviderSelectedAt: Number.NaN }],
+    ["infinite", { activeProviderSelectedAt: Number.POSITIVE_INFINITY }],
+    ["a string", { activeProviderSelectedAt: String(pickedAt) }],
+    ["stored without an account", { activeProvider: null, activeProviderSelectedAt: pickedAt }],
+  ])("hydrates a pick time that is %s as undefined", (_label, stored) => {
+    const merge = useComposerDraftStore.persist.getOptions().merge!;
+
+    const hydrated = merge(
+      {
+        draftsByThreadKey: {
+          [scopedThreadKey(threadRef)]: {
+            prompt: "Next message",
+            attachments: [],
+            modelSelectionByProvider: {
+              [personal]: createModelSelection(personal, "claude-opus-4-6"),
+            },
+            activeProvider: personal,
+            ...stored,
+          },
+        },
+      },
+      useComposerDraftStore.getInitialState(),
+    );
+
+    const draft = hydrated.draftsByThreadKey[scopedThreadKey(threadRef)];
+    expect(draft?.prompt).toBe("Next message");
+    expect(draft?.activeProviderSelectedAt).toBeUndefined();
   });
 });
 
