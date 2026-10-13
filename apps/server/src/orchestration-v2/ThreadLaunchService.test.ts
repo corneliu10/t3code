@@ -2816,6 +2816,25 @@ it.effect(
         fromProviderInstanceId: failoverFrom,
         fromResetsAt: quotaResetsAt,
       });
+      // The thread is created on the substitute, never on the chosen account
+      // and then switched over.
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const launchEvents = yield* threads
+        .streamStoredEventsFrom({ threadId: launched.threadId })
+        .pipe(
+          Stream.map((stored) => stored.event),
+          Stream.takeUntil((event) => event.type === "run.created"),
+          Stream.runCollect,
+        );
+      const created = launchEvents.find((event) => event.type === "thread.created");
+      assert.equal(
+        created?.type === "thread.created" ? created.payload.modelSelection.instanceId : null,
+        failoverTo,
+      );
+      assert.notInclude(
+        launchEvents.map((event) => event.type),
+        "thread.provider-switched",
+      );
     }).pipe(Effect.provide(harness.layer));
   },
 );
