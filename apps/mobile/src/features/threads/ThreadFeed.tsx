@@ -4,6 +4,7 @@ import { useMarkdownImageSource } from "../../native/useMarkdownImageSource";
 import { enrichedContextLinkPresentation } from "../../lib/enrichedLinkPresentation";
 import { ThreadContextDivider } from "./thread-context-divider";
 import { ThreadHandoffRow } from "./thread-handoff-row";
+import { useProviderFailoverNotices } from "./thread-provider-failover";
 import { SecretRequestCard } from "./SecretRequestCard";
 import { AppActivityIndicator } from "../../components/AppActivityIndicator";
 import {
@@ -946,17 +947,27 @@ function useMarkdownStyles(): MarkdownStyleSets {
   ]);
 }
 
+/** The quiet line above a user message: who sent it, or that its run moved accounts. */
+function UserMessageNote(props: { readonly children: ReactNode; readonly className?: string }) {
+  return (
+    <Text
+      className={cn(
+        "mb-1 pr-1 font-t3-medium text-2xs text-foreground-muted opacity-60",
+        props.className,
+      )}
+    >
+      {props.children}
+    </Text>
+  );
+}
+
 function AgentMessageAttribution(props: {
   readonly environmentId: EnvironmentId;
   readonly senderThreadId?: ThreadId;
 }) {
   const navigation = useNavigation();
   const senderThreadId = props.senderThreadId;
-  const label = (
-    <Text className="mb-1 pr-1 font-t3-medium text-2xs text-foreground-muted opacity-60">
-      Sent by another agent
-    </Text>
-  );
+  const label = <UserMessageNote>Sent by another agent</UserMessageNote>;
   return senderThreadId ? (
     <Pressable
       accessibilityRole="button"
@@ -995,6 +1006,8 @@ function renderFeedEntry(
     readonly terminalAssistantMessageIds: ReadonlySet<string>;
     readonly unsettledTurnId: RunId | null;
     readonly failedRunIds: ReadonlySet<RunId>;
+    /** The notice above each message that started a run the server moved to another account. */
+    readonly providerFailoverNotices: ReadonlyMap<MessageId, string>;
     readonly onCopyWorkRow: (rowId: string, value: string) => void;
     readonly onToggleWorkGroup: (groupId: string, anchorKey?: string) => void;
     readonly onToggleWorkRow: (rowId: string, anchorKey?: string) => void;
@@ -1169,6 +1182,7 @@ function renderFeedEntry(
     if (isUser) {
       const enterAnimated = isFreshTimestamp(message.createdAt);
       const intentBadge = resolveUserMessageIntentBadge(message.inputIntent);
+      const providerFailoverNotice = props.providerFailoverNotices.get(message.id);
       const referenceIds = new Set(
         collectComposerContextReferences(message.text).map((reference) => reference.contextId),
       );
@@ -1187,14 +1201,13 @@ function renderFeedEntry(
           className="mb-5 items-end"
           {...(enterAnimated ? { entering: FadeInUp.duration(220) } : {})}
         >
+          {providerFailoverNotice !== undefined ? (
+            <UserMessageNote className="text-right">{providerFailoverNotice}</UserMessageNote>
+          ) : null}
           {presentation.attribution === "automation" ? (
-            <Text className="mb-1 pr-1 font-t3-medium text-2xs text-foreground-muted opacity-60">
-              Sent by automation
-            </Text>
+            <UserMessageNote>Sent by automation</UserMessageNote>
           ) : presentation.attribution === "t3code" ? (
-            <Text className="mb-1 pr-1 font-t3-medium text-2xs text-foreground-muted opacity-60">
-              Sent by T3 Code
-            </Text>
+            <UserMessageNote>Sent by T3 Code</UserMessageNote>
           ) : presentation.attribution === "agent" ? (
             <AgentMessageAttribution
               environmentId={props.environmentId}
@@ -2245,6 +2258,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     () => failedFeedRunIds(props.feed, props.latestRun),
     [props.feed, props.latestRun],
   );
+  const providerFailoverNotices = useProviderFailoverNotices(props.environmentId, props.threadId);
   const terminalAssistantMessageIds = useMemo(() => {
     const terminalIdsByTurn = new Map<RunId, string>();
     for (const entry of props.feed) {
@@ -2521,6 +2535,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
               terminalAssistantMessageIds,
               unsettledTurnId,
               failedRunIds,
+              providerFailoverNotices,
               onCopyWorkRow,
               onToggleWorkGroup,
               onToggleWorkRow,
@@ -2570,6 +2585,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       terminalAssistantMessageIds,
       unsettledTurnId,
       failedRunIds,
+      providerFailoverNotices,
       iconSubtleColor,
       screenColor,
       userBubbleColor,

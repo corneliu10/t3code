@@ -38,6 +38,10 @@ import { parseScopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/en
 import { useAtomValue } from "@effect/atom-react";
 import { environmentThreadDetails } from "../../state/threads";
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
+import {
+  describeRunProviderFailover,
+  type ProviderFailoverRun,
+} from "@t3tools/client-runtime/provider-failover-notice";
 import { Link } from "@tanstack/react-router";
 import { canForkProjectedAssistantItem } from "@t3tools/client-runtime/state/thread-workflows";
 import { notificationChildThreadId } from "@t3tools/client-runtime/state/thread-execution";
@@ -80,6 +84,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
@@ -312,6 +317,9 @@ import {
 // components (LiveElapsed) handle it.
 // ---------------------------------------------------------------------------
 
+/** What the rows read of a run: handoff endpoints and the failover notice. */
+type TimelineRun = HandoffTimelineRun & ProviderFailoverRun;
+
 interface TimelineRowSharedState {
   citationRequest: AssistantCitationTarget | null;
   listRef: React.RefObject<LegendListRef | null>;
@@ -324,8 +332,8 @@ interface TimelineRowSharedState {
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   /** Provider snapshots for resolving handoff endpoints to icons + model names. */
   providerStatuses: ReadonlyArray<ServerProvider>;
-  /** Projection runs, for recovering handoff models on legacy items. */
-  runs: ReadonlyArray<HandoffTimelineRun>;
+  /** Projection runs, for recovering handoff models on legacy items and for failover notices. */
+  runs: ReadonlyArray<TimelineRun>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
   onUseArtifactTemplate: (template: CodexArtifactTemplate) => void;
@@ -428,7 +436,7 @@ const TIMELINE_MAINTAIN_SCROLL_AT_END = {
     layout: true,
   },
 } as const satisfies MaintainScrollAtEndOptions;
-const EMPTY_TIMELINE_RUNS: ReadonlyArray<HandoffTimelineRun> = [];
+const EMPTY_TIMELINE_RUNS: ReadonlyArray<TimelineRun> = [];
 const EMPTY_RUN_IDS: ReadonlySet<RunId> = new Set();
 // Streamed text lands a paragraph at a time. A smooth scroll to the end
 // turns each landing into a short glide instead of a jump. Thread switches
@@ -514,7 +522,7 @@ interface MessagesTimelineProps {
   workspaceRoot: string | undefined;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   providerStatuses: ReadonlyArray<ServerProvider>;
-  runs: ReadonlyArray<HandoffTimelineRun>;
+  runs: ReadonlyArray<TimelineRun>;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   onAnchorSizeChanged: (messageId: MessageId, size: number) => void;
@@ -951,7 +959,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   const rows = useStableRows(rawRows, listIdentityKey);
   // Run status/timestamps churn on every stream event; the shared row context
   // must not change with them or every timeline row re-renders per event.
-  const runs = useStableHandoffRuns(runsProp);
+  const runs = useStableTimelineRuns(runsProp);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const restoreRowIndex =
     restoringThreadPosition && rememberedPosition?.atEnd === false
@@ -2304,6 +2312,18 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     (attachment) => !isImageAttachment(attachment) && !isFileAttachment(attachment),
   );
   const userMessage = resolveUserMessagePresentation(row.message);
+  const { providerStatuses, runs, timestampFormat } = ctx;
+  const failoverNotice = useMemo(() => {
+    // Only the message that started the failover run: a steer into it is no new move.
+    const run = runs.find((candidate) => candidate.userMessageId === row.message.id);
+    return run === undefined
+      ? null
+      : describeRunProviderFailover({
+          run,
+          providers: providerStatuses,
+          formatTime: (iso) => formatUpcomingTimestamp(iso, timestampFormat),
+        });
+  }, [providerStatuses, row.message.id, runs, timestampFormat]);
   const resolvedContext = useMemo(() => resolveUserMessageContext(row.message), [row.message]);
   const previewImages = useMemo(
     () => userImages.filter((image) => image.name.startsWith("preview-annotation-")),
@@ -2437,11 +2457,13 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
   return (
     <div className="group flex flex-col items-end gap-1">
+      {failoverNotice !== null ? (
+        <UserMessageNote data-provider-failover-notice="true" className="text-right">
+          {failoverNotice}
+        </UserMessageNote>
+      ) : null}
       {userMessage.attribution === "automation" ? (
-        <p
-          className="me-1 text-2xs text-muted-foreground/70"
-          data-user-message-attribution="automation"
-        >
+        <UserMessageNote data-user-message-attribution="automation">
           {userMessage.scheduledTaskId ? (
             <Link
               to="/settings/scheduled-tasks"
@@ -2456,16 +2478,11 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           ) : (
             "Sent by automation"
           )}
-        </p>
+        </UserMessageNote>
       ) : userMessage.attribution === "t3code" ? (
-        <p
-          className="me-1 text-2xs text-muted-foreground/70"
-          data-user-message-attribution="t3code"
-        >
-          Sent by T3 Code
-        </p>
+        <UserMessageNote data-user-message-attribution="t3code">Sent by T3 Code</UserMessageNote>
       ) : userMessage.attribution === "agent" ? (
-        <p className="me-1 text-2xs text-muted-foreground/70" data-user-message-attribution="agent">
+        <UserMessageNote data-user-message-attribution="agent">
           {senderThreadId ? (
             <InlineButton
               onClick={() => ctx.onOpenThread(senderThreadId)}
@@ -2477,7 +2494,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           ) : (
             "Sent by another agent"
           )}
-        </p>
+        </UserMessageNote>
       ) : null}
       {row.message.inputIntent && row.message.inputIntent !== "turn_start" ? (
         <UserMessageIntentMarker intent={row.message.inputIntent} />
@@ -2644,6 +2661,11 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
       </div>
     </div>
   );
+}
+
+/** The quiet line above a user message: who sent it, or that its run moved accounts. */
+function UserMessageNote({ className, ...props }: ComponentProps<"p">) {
+  return <p className={cn("me-1 text-2xs text-muted-foreground/70", className)} {...props} />;
 }
 
 function UserMessageIntentMarker({
@@ -4966,22 +4988,21 @@ function UserMessageReviewCommentCard({ comment }: { comment: ReviewCommentConte
 // so LegendList (and React) can skip re-rendering unchanged items.
 // ---------------------------------------------------------------------------
 
-/** Content-stable projection of the runs the handoff rows read. The incoming
- *  array is rebuilt on every projection event (status/timestamp churn), but
- *  the returned reference only changes when a run's identity-relevant fields
- *  (id, ordinal, instance, model) do — keeping TimelineRowCtx stable. */
-function useStableHandoffRuns(
-  runs: ReadonlyArray<HandoffTimelineRun>,
-): ReadonlyArray<HandoffTimelineRun> {
+/** Content-stable projection of the runs the handoff and failover rows read.
+ *  The incoming array is rebuilt on every projection event (status/timestamp
+ *  churn), but the returned reference only changes when a run's
+ *  identity-relevant fields (id, ordinal, instance, model, first message,
+ *  failover) do — keeping TimelineRowCtx stable. */
+function useStableTimelineRuns(runs: ReadonlyArray<TimelineRun>): ReadonlyArray<TimelineRun> {
   const prev = useRef<{
     signature: string;
-    value: ReadonlyArray<HandoffTimelineRun>;
+    value: ReadonlyArray<TimelineRun>;
   }>({ signature: "", value: EMPTY_TIMELINE_RUNS });
   return useMemo(() => {
     const signature = runs
       .map(
         (run) =>
-          `${run.id}\0${run.providerInstanceId}\0${run.ordinal}\0${run.modelSelection.instanceId}\0${run.modelSelection.model}`,
+          `${run.id}\0${run.providerInstanceId}\0${run.ordinal}\0${run.modelSelection.instanceId}\0${run.modelSelection.model}\0${run.userMessageId}\0${run.providerFailover?.reason}\0${run.providerFailover?.fromProviderInstanceId}\0${run.providerFailover?.fromResetsAt}`,
       )
       .join("\n");
     if (signature === prev.current.signature) {
@@ -4992,6 +5013,8 @@ function useStableHandoffRuns(
       ordinal: run.ordinal,
       providerInstanceId: run.providerInstanceId,
       modelSelection: run.modelSelection,
+      userMessageId: run.userMessageId,
+      ...(run.providerFailover === undefined ? {} : { providerFailover: run.providerFailover }),
     }));
     prev.current = { signature, value };
     return value;

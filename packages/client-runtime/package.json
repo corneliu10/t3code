@@ -39,6 +39,10 @@
       "types": "./src/userMessage.ts",
       "default": "./src/userMessage.ts"
     },
+    "./provider-failover-notice": {
+      "types": "./src/providerFailoverNotice.ts",
+      "default": "./src/providerFailoverNotice.ts"
+    },
     "./prompt-links": {
       "types": "./src/promptLinks.ts",
       "default": "./src/promptLinks.ts"
