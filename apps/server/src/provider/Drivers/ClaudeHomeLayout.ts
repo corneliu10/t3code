@@ -1,6 +1,7 @@
 import type { ClaudeSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
@@ -98,6 +99,7 @@ export class ClaudeShadowHomeFileSystemError extends Schema.TaggedError<ClaudeSh
       "makeDirectory",
       "readDirectory",
       "readLink",
+      "realPath",
       "remove",
       "stat",
       "symlink",
@@ -117,10 +119,47 @@ export class ClaudeShadowHomeFileSystemError extends Schema.TaggedError<ClaudeSh
 
 export class ClaudeShadowHomePathConflictError extends Schema.TaggedError<ClaudeShadowHomePathConflictError>()(
   "ClaudeShadowHomePathConflictError",
-  ClaudeShadowHomeContext,
+  {
+    ...ClaudeShadowHomeContext,
+    /** Set when only the real paths (after symlinks and letter case) collide. */
+    resolvedSharedHomePath: Schema.optional(Schema.String),
+    resolvedEffectiveHomePath: Schema.optional(Schema.String),
+  },
 ) {
   override get message(): string {
-    return `Claude shadow home path '${this.effectiveHomePath}' and shared home path '${this.sharedHomePath}' must be separate directories, neither inside the other.`;
+    const resolved =
+      this.resolvedSharedHomePath === undefined || this.resolvedEffectiveHomePath === undefined
+        ? ""
+        : ` They resolve to '${this.resolvedEffectiveHomePath}' and '${this.resolvedSharedHomePath}'.`;
+    return `Claude shadow home path '${this.effectiveHomePath}' and shared home path '${this.sharedHomePath}' must be separate directories, neither inside the other.${resolved}`;
+  }
+}
+
+/**
+ * How a conflicting entry is folded into the shared home: a directory's
+ * contents move, `history.jsonl` is appended, and a setup file is one or the
+ * other.
+ */
+const ClaudeShadowHomeEntryKind = Schema.Literals(["directory", "appendFile", "chooseFile"]);
+type ClaudeShadowHomeEntryKind = typeof ClaudeShadowHomeEntryKind.Type;
+
+const ClaudeShadowHomeConflictingEntry = Schema.Struct({
+  entryName: Schema.String,
+  linkPath: Schema.String,
+  targetPath: Schema.String,
+  kind: ClaudeShadowHomeEntryKind,
+});
+type ClaudeShadowHomeConflictingEntry = typeof ClaudeShadowHomeConflictingEntry.Type;
+
+function conflictInstruction(entry: ClaudeShadowHomeConflictingEntry): string {
+  const { linkPath, targetPath } = entry;
+  switch (entry.kind) {
+    case "directory":
+      return `Move the contents of '${linkPath}' into '${targetPath}', then delete '${linkPath}'.`;
+    case "appendFile":
+      return `Append '${linkPath}' to '${targetPath}', then delete '${linkPath}'.`;
+    case "chooseFile":
+      return `Keep one of '${linkPath}' and '${targetPath}' as '${targetPath}' (merge them by hand if needed), then delete '${linkPath}'.`;
   }
 }
 
@@ -128,13 +167,20 @@ export class ClaudeShadowHomeEntryConflictError extends Schema.TaggedError<Claud
   "ClaudeShadowHomeEntryConflictError",
   {
     ...ClaudeShadowHomeContext,
-    entryName: Schema.String,
-    linkPath: Schema.String,
-    targetPath: Schema.String,
+    /** Every allowlisted entry in the way, in allowlist order. */
+    entries: Schema.Array(ClaudeShadowHomeConflictingEntry),
   },
 ) {
   override get message(): string {
-    return `Cannot link Claude shadow home entry '${this.entryName}': '${this.linkPath}' already exists and is not a symlink or an empty directory. Move its contents into '${this.targetPath}', then delete '${this.linkPath}'.`;
+    const count =
+      this.entries.length === 1
+        ? "1 already exists as a real file or non-empty directory."
+        : `${this.entries.length} already exist as real files or non-empty directories.`;
+    return [
+      `Cannot link the Claude shadow home's shared entries: ${count}`,
+      ...this.entries.map(conflictInstruction),
+      "Then restart T3 Code.",
+    ].join(" ");
   }
 }
 
@@ -226,74 +272,111 @@ const isEmptyRealDirectory = Effect.fn("ClaudeHomeLayout.isEmptyRealDirectory")(
   return entries.length === 0;
 });
 
-const ensureSymlink = Effect.fn("ClaudeHomeLayout.ensureSymlink")(function* (
-  input: EntryInput,
-): Effect.fn.Return<void, ClaudeShadowHomeError, Path.Path> {
-  const path = yield* Path.Path;
-  const target = path.join(input.sharedHomePath, input.entryName);
-  const link = path.join(input.effectiveHomePath, input.entryName);
-  const state = yield* readLinkState({ ...input, linkPath: link });
+/** What one allowlisted entry needs, decided before anything is changed. */
+type EntryPlan =
+  | { readonly _tag: "Keep" }
+  | { readonly _tag: "Create" }
+  | { readonly _tag: "ReplaceEmptyDirectory" }
+  | { readonly _tag: "Relink" }
+  | { readonly _tag: "Conflict"; readonly entry: ClaudeShadowHomeConflictingEntry };
 
+interface PlannedEntry extends EntryInput {
+  readonly linkPath: string;
+  readonly targetPath: string;
+  readonly plan: EntryPlan;
+}
+
+const planEntry = Effect.fn("ClaudeHomeLayout.planEntry")(function* (
+  input: EntryInput & { readonly kind: ClaudeShadowHomeEntryKind },
+): Effect.fn.Return<PlannedEntry, ClaudeShadowHomeError, Path.Path> {
+  const path = yield* Path.Path;
+  const targetPath = path.join(input.sharedHomePath, input.entryName);
+  const linkPath = path.join(input.effectiveHomePath, input.entryName);
+  const planned = (plan: EntryPlan): PlannedEntry => ({ ...input, linkPath, targetPath, plan });
+  const state = yield* readLinkState({ ...input, linkPath });
+
+  switch (state._tag) {
+    case "Missing":
+      return planned({ _tag: "Create" });
+    case "NotSymlink":
+      // The CLI creates empty `plugins/` and `skills/` on a fresh home. Those
+      // hold nothing, so they give way to the link; anything with data does not.
+      return (yield* isEmptyRealDirectory({ ...input, linkPath }))
+        ? planned({ _tag: "ReplaceEmptyDirectory" })
+        : planned({
+            _tag: "Conflict",
+            entry: { entryName: input.entryName, linkPath, targetPath, kind: input.kind },
+          });
+    case "Symlink":
+      return path.resolve(path.dirname(linkPath), state.target) === targetPath
+        ? planned({ _tag: "Keep" })
+        : planned({ _tag: "Relink" });
+  }
+});
+
+const applyEntryPlan = Effect.fn("ClaudeHomeLayout.applyEntryPlan")(function* (
+  entry: PlannedEntry,
+): Effect.fn.Return<void, ClaudeShadowHomeError> {
   const removeExisting = (options?: { readonly recursive: boolean }) =>
-    input.fileSystem.remove(link, options).pipe(
+    entry.fileSystem.remove(entry.linkPath, options).pipe(
       Effect.catchTags({
         PlatformError: (cause) =>
           new ClaudeShadowHomeFileSystemError({
-            sharedHomePath: input.sharedHomePath,
-            effectiveHomePath: input.effectiveHomePath,
+            sharedHomePath: entry.sharedHomePath,
+            effectiveHomePath: entry.effectiveHomePath,
             operation: "remove",
-            path: link,
-            entryName: input.entryName,
+            path: entry.linkPath,
+            entryName: entry.entryName,
             cause,
           }),
       }),
     );
-  const createLink = input.fileSystem.symlink(target, link).pipe(
+  const createLink = entry.fileSystem.symlink(entry.targetPath, entry.linkPath).pipe(
     Effect.catchTags({
       PlatformError: (cause) =>
         new ClaudeShadowHomeFileSystemError({
-          sharedHomePath: input.sharedHomePath,
-          effectiveHomePath: input.effectiveHomePath,
+          sharedHomePath: entry.sharedHomePath,
+          effectiveHomePath: entry.effectiveHomePath,
           operation: "symlink",
-          path: link,
-          targetPath: target,
-          entryName: input.entryName,
+          path: entry.linkPath,
+          targetPath: entry.targetPath,
+          entryName: entry.entryName,
           cause,
         }),
     }),
   );
 
-  if (state._tag === "Missing") {
-    return yield* createLink;
-  }
-
-  if (state._tag === "NotSymlink") {
-    // The CLI creates empty `plugins/` and `skills/` on a fresh home. Those
-    // hold nothing, so they give way to the link; anything with data does not.
-    if (!(yield* isEmptyRealDirectory({ ...input, linkPath: link }))) {
-      return yield* new ClaudeShadowHomeEntryConflictError({
-        sharedHomePath: input.sharedHomePath,
-        effectiveHomePath: input.effectiveHomePath,
-        entryName: input.entryName,
-        linkPath: link,
-        targetPath: target,
-      });
-    }
-    // Node's `rm` refuses any directory without `recursive`; it was empty a moment ago.
-    yield* removeExisting({ recursive: true });
-    return yield* createLink;
-  }
-
-  if (path.resolve(path.dirname(link), state.target) !== target) {
-    yield* removeExisting();
-    yield* createLink;
+  switch (entry.plan._tag) {
+    case "Keep":
+    case "Conflict":
+      return;
+    case "Create":
+      return yield* createLink;
+    case "ReplaceEmptyDirectory":
+      // Node's `rm` refuses any directory without `recursive`; it was empty a moment ago.
+      yield* removeExisting({ recursive: true });
+      return yield* createLink;
+    case "Relink":
+      yield* removeExisting();
+      return yield* createLink;
   }
 });
+
+/** Same directory by device and inode, which sees through letter case. */
+function isSameFile(left: FileSystem.File.Info, right: FileSystem.File.Info): boolean {
+  return (
+    left.dev === right.dev &&
+    Option.isSome(left.ino) &&
+    Option.isSome(right.ino) &&
+    left.ino.value === right.ino.value
+  );
+}
 
 /**
  * Link the shared session and setup entries into the shadow home. A no-op in
  * direct mode. Only allowlisted entries are touched; data in the shadow is
- * never moved, merged or deleted.
+ * never moved, merged or deleted. Every entry is checked before any is
+ * changed, so a conflict leaves the shadow home exactly as it was.
  */
 export const materializeClaudeShadowHome = Effect.fn("materializeClaudeShadowHome")(function* (
   layout: ClaudeHomeLayout,
@@ -303,15 +386,14 @@ export const materializeClaudeShadowHome = Effect.fn("materializeClaudeShadowHom
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
-  if (
-    isSameOrInside(path, sharedHomePath, effectiveHomePath) ||
-    isSameOrInside(path, effectiveHomePath, sharedHomePath)
-  ) {
+  const isNested = (left: string, right: string) =>
+    isSameOrInside(path, left, right) || isSameOrInside(path, right, left);
+  if (isNested(sharedHomePath, effectiveHomePath)) {
     return yield* new ClaudeShadowHomePathConflictError({ sharedHomePath, effectiveHomePath });
   }
 
   const fileSystemError = (
-    operation: "exists" | "makeDirectory" | "writeFile",
+    operation: "exists" | "makeDirectory" | "realPath" | "stat" | "writeFile",
     errorPath: string,
     cause: PlatformError.PlatformError,
   ) =>
@@ -336,16 +418,58 @@ export const materializeClaudeShadowHome = Effect.fn("materializeClaudeShadowHom
         PlatformError: (cause) => fileSystemError("makeDirectory", directoryPath, cause),
       }),
     );
+  const realPath = (directoryPath: string) =>
+    fileSystem.realPath(directoryPath).pipe(
+      Effect.catchTags({
+        PlatformError: (cause) => fileSystemError("realPath", directoryPath, cause),
+      }),
+    );
+  const stat = (filePath: string) =>
+    fileSystem
+      .stat(filePath)
+      .pipe(
+        Effect.catchTags({ PlatformError: (cause) => fileSystemError("stat", filePath, cause) }),
+      );
+  /** Whether `child`, or any directory above it, is `parent` itself. */
+  const isInsideByIdentity = Effect.fnUntraced(function* (parent: string, child: string) {
+    const parentInfo = yield* stat(parent);
+    let current = child;
+    while (true) {
+      if (isSameFile(parentInfo, yield* stat(current))) return true;
+      const above = path.dirname(current);
+      if (above === current) return false;
+      current = above;
+    }
+  });
 
-  yield* Effect.all(
-    [
-      makeDirectory(sharedHomePath),
-      makeDirectory(effectiveHomePath),
-      ...CLAUDE_SHARED_DIRECTORIES.map((directory) =>
-        makeDirectory(path.join(sharedHomePath, directory)),
-      ),
-    ],
-    { concurrency: "unbounded" },
+  yield* Effect.all([makeDirectory(sharedHomePath), makeDirectory(effectiveHomePath)], {
+    concurrency: "unbounded",
+  });
+
+  // The textual check above misses a symlinked path and a letter-case variant
+  // on a case-insensitive disk. Either would make each shared entry a link to
+  // itself, so the real directories are compared before anything is linked.
+  const [resolvedSharedHomePath, resolvedEffectiveHomePath] = yield* Effect.all([
+    realPath(sharedHomePath),
+    realPath(effectiveHomePath),
+  ]);
+  if (
+    isNested(resolvedSharedHomePath, resolvedEffectiveHomePath) ||
+    (yield* isInsideByIdentity(resolvedSharedHomePath, resolvedEffectiveHomePath)) ||
+    (yield* isInsideByIdentity(resolvedEffectiveHomePath, resolvedSharedHomePath))
+  ) {
+    return yield* new ClaudeShadowHomePathConflictError({
+      sharedHomePath,
+      effectiveHomePath,
+      resolvedSharedHomePath,
+      resolvedEffectiveHomePath,
+    });
+  }
+
+  yield* Effect.forEach(
+    CLAUDE_SHARED_DIRECTORIES,
+    (directory) => makeDirectory(path.join(sharedHomePath, directory)),
+    { concurrency: "unbounded", discard: true },
   );
 
   yield* Effect.forEach(
@@ -367,10 +491,25 @@ export const materializeClaudeShadowHome = Effect.fn("materializeClaudeShadowHom
   );
 
   const optionalFiles = yield* Effect.filter(CLAUDE_SHARED_OPTIONAL_FILES, sharedExists);
+  const entries: ReadonlyArray<readonly [string, ClaudeShadowHomeEntryKind]> = [
+    ...CLAUDE_SHARED_DIRECTORIES.map((name) => [name, "directory"] as const),
+    ...CLAUDE_SHARED_CREATED_FILES.map((name) => [name, "appendFile"] as const),
+    ...optionalFiles.map((name) => [name, "chooseFile"] as const),
+  ];
 
-  yield* Effect.forEach(
-    [...CLAUDE_SHARED_DIRECTORIES, ...CLAUDE_SHARED_CREATED_FILES, ...optionalFiles],
-    (entryName) => ensureSymlink({ fileSystem, sharedHomePath, effectiveHomePath, entryName }),
-    { discard: true },
+  const plans = yield* Effect.forEach(entries, ([entryName, kind]) =>
+    planEntry({ fileSystem, sharedHomePath, effectiveHomePath, entryName, kind }),
   );
+  const conflicts = plans.flatMap((planned) =>
+    planned.plan._tag === "Conflict" ? [planned.plan.entry] : [],
+  );
+  if (conflicts.length > 0) {
+    return yield* new ClaudeShadowHomeEntryConflictError({
+      sharedHomePath,
+      effectiveHomePath,
+      entries: conflicts,
+    });
+  }
+
+  yield* Effect.forEach(plans, applyEntryPlan, { discard: true });
 });

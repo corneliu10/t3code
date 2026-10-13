@@ -247,19 +247,19 @@ it.layer(NodeServices.layer)("ClaudeHomeLayout", (it) => {
 
           const error = yield* materializeClaudeShadowHome(layout).pipe(Effect.flip);
 
+          const linkPath = path.join(shadowHome, "projects");
+          const targetPath = path.join(sharedHome, "projects");
           expect(error).toBeInstanceOf(ClaudeShadowHomeEntryConflictError);
           expect(error).toMatchObject({
             sharedHomePath: sharedHome,
             effectiveHomePath: shadowHome,
-            entryName: "projects",
-            linkPath: path.join(shadowHome, "projects"),
-            targetPath: path.join(sharedHome, "projects"),
+            entries: [{ entryName: "projects", linkPath, targetPath, kind: "directory" }],
           });
           expect(error.message).toBe(
-            `Cannot link Claude shadow home entry 'projects': '${path.join(shadowHome, "projects")}' already exists and is not a symlink or an empty directory. Move its contents into '${path.join(sharedHome, "projects")}', then delete '${path.join(shadowHome, "projects")}'.`,
+            `Cannot link the Claude shadow home's shared entries: 1 already exists as a real file or non-empty directory. Move the contents of '${linkPath}' into '${targetPath}', then delete '${linkPath}'. Then restart T3 Code.`,
           );
           expect(yield* fileSystem.readFileString(transcript)).toBe('{"turn":1}\n');
-          expect(yield* isSymlink(path.join(shadowHome, "projects"))).toBe(false);
+          expect(yield* isSymlink(linkPath)).toBe(false);
         }),
     );
 
@@ -273,11 +273,71 @@ it.layer(NodeServices.layer)("ClaudeHomeLayout", (it) => {
         const error = yield* materializeClaudeShadowHome(layout).pipe(Effect.flip);
 
         expect(error).toBeInstanceOf(ClaudeShadowHomeEntryConflictError);
-        expect(error).toMatchObject({ entryName: "history.jsonl" });
+        expect(error).toMatchObject({
+          entries: [{ entryName: "history.jsonl", kind: "appendFile" }],
+        });
         expect(yield* fileSystem.readFileString(path.join(shadowHome, "history.jsonl"))).toBe(
           '{"local":true}\n',
         );
       }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "reports every conflicting entry at once and changes nothing in the shadow home",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const { sharedHome, shadowHome, layout } = yield* makeHomes();
+          yield* writeTextFile(path.join(sharedHome, "settings.json"), '{"shared":true}\n');
+          yield* writeTextFile(path.join(shadowHome, "projects", "a", "b.jsonl"), "{}\n");
+          yield* writeTextFile(path.join(shadowHome, "todos", "t.json"), "[]\n");
+          yield* writeTextFile(path.join(shadowHome, "history.jsonl"), '{"local":true}\n');
+          yield* writeTextFile(path.join(shadowHome, "settings.json"), '{"shadow":true}\n');
+          // Entries that would be fixed up without a conflict stay as they are.
+          yield* fileSystem.makeDirectory(path.join(shadowHome, "plugins"));
+          yield* fileSystem.symlink("/somewhere-else", path.join(shadowHome, "plans"));
+
+          const error = yield* materializeClaudeShadowHome(layout).pipe(Effect.flip);
+
+          const entry = (entryName: string) => ({
+            linkPath: path.join(shadowHome, entryName),
+            targetPath: path.join(sharedHome, entryName),
+          });
+          const projects = entry("projects");
+          const todos = entry("todos");
+          const history = entry("history.jsonl");
+          const settings = entry("settings.json");
+          expect(error).toBeInstanceOf(ClaudeShadowHomeEntryConflictError);
+          if (error._tag !== "ClaudeShadowHomeEntryConflictError") {
+            return expect.fail("Expected ClaudeShadowHomeEntryConflictError");
+          }
+          expect(error.entries).toEqual([
+            { entryName: "projects", ...projects, kind: "directory" },
+            { entryName: "todos", ...todos, kind: "directory" },
+            { entryName: "history.jsonl", ...history, kind: "appendFile" },
+            { entryName: "settings.json", ...settings, kind: "chooseFile" },
+          ]);
+          expect(error.message).toBe(
+            [
+              "Cannot link the Claude shadow home's shared entries: 4 already exist as real files or non-empty directories.",
+              `Move the contents of '${projects.linkPath}' into '${projects.targetPath}', then delete '${projects.linkPath}'.`,
+              `Move the contents of '${todos.linkPath}' into '${todos.targetPath}', then delete '${todos.linkPath}'.`,
+              `Append '${history.linkPath}' to '${history.targetPath}', then delete '${history.linkPath}'.`,
+              `Keep one of '${settings.linkPath}' and '${settings.targetPath}' as '${settings.targetPath}' (merge them by hand if needed), then delete '${settings.linkPath}'.`,
+              "Then restart T3 Code.",
+            ].join(" "),
+          );
+          expect(yield* isSymlink(path.join(shadowHome, "plugins"))).toBe(false);
+          expect(yield* fileSystem.readDirectory(path.join(shadowHome, "plugins"))).toEqual([]);
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "plans"))).toBe(
+            "/somewhere-else",
+          );
+          expect(yield* fileSystem.exists(path.join(shadowHome, "skills"))).toBe(false);
+          expect(yield* isSymlink(path.join(shadowHome, "skills"))).toBe(false);
+          expect(yield* fileSystem.readFileString(settings.linkPath)).toBe('{"shadow":true}\n');
+          expect(yield* fileSystem.readFileString(settings.targetPath)).toBe('{"shared":true}\n');
+        }),
     );
 
     it.effect.skipIf(!symlinksSupported)("replaces a symlink that points elsewhere", () =>
@@ -350,6 +410,108 @@ it.layer(NodeServices.layer)("ClaudeHomeLayout", (it) => {
             `Claude shadow home path '${layout.effectiveHomePath}' and shared home path '${layout.sharedHomePath}' must be separate directories, neither inside the other.`,
           );
         }
+      }),
+    );
+
+    const expectSharedHomeUntouched = Effect.fn("ClaudeHomeLayout.test.expectSharedHomeUntouched")(
+      function* (sharedHome: string) {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        for (const directory of ["plugins", "skills"]) {
+          expect(yield* isSymlink(path.join(sharedHome, directory))).toBe(false);
+          expect(yield* fileSystem.readDirectory(path.join(sharedHome, directory))).toEqual([]);
+        }
+        expect(yield* isSymlink(path.join(sharedHome, "projects"))).toBe(false);
+        expect(
+          yield* fileSystem.readFileString(path.join(sharedHome, "projects", "a", "b.jsonl")),
+        ).toBe("{}\n");
+      },
+    );
+
+    const makeUsedSharedHome = Effect.fn("ClaudeHomeLayout.test.makeUsedSharedHome")(function* (
+      root: string,
+    ) {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const sharedHome = path.join(root, "claude");
+      // A fresh home's empty folders, which a self-referencing shadow would
+      // replace with links to themselves, and one with a session in it.
+      yield* fileSystem.makeDirectory(path.join(sharedHome, "plugins"), { recursive: true });
+      yield* fileSystem.makeDirectory(path.join(sharedHome, "skills"), { recursive: true });
+      yield* writeTextFile(path.join(sharedHome, "projects", "a", "b.jsonl"), "{}\n");
+      return sharedHome;
+    });
+
+    it.effect.skipIf(!symlinksSupported)(
+      "rejects a shadow home that is a symlink to the shared home and touches nothing",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* fileSystem.realPath(yield* makeTempDir("t3code-claude-alias-"));
+          const sharedHome = yield* makeUsedSharedHome(root);
+          const shadowHome = path.join(root, "claude-work");
+          yield* fileSystem.symlink(sharedHome, shadowHome);
+          const layout = yield* resolveClaudeHomeLayout({
+            homePath: sharedHome,
+            shadowHomePath: shadowHome,
+          });
+
+          const error = yield* materializeClaudeShadowHome(layout).pipe(Effect.flip);
+
+          expect(error).toBeInstanceOf(ClaudeShadowHomePathConflictError);
+          expect(error).toMatchObject({
+            sharedHomePath: sharedHome,
+            effectiveHomePath: shadowHome,
+          });
+          expect(error.message).toBe(
+            `Claude shadow home path '${shadowHome}' and shared home path '${sharedHome}' must be separate directories, neither inside the other. They resolve to '${sharedHome}' and '${sharedHome}'.`,
+          );
+          yield* expectSharedHomeUntouched(sharedHome);
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
+      "rejects a shadow home under a symlinked parent that points into the shared home",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* fileSystem.realPath(yield* makeTempDir("t3code-claude-alias-"));
+          const sharedHome = yield* makeUsedSharedHome(root);
+          yield* fileSystem.symlink(sharedHome, path.join(root, "accounts"));
+          const shadowHome = path.join(root, "accounts", "work");
+          const layout = yield* resolveClaudeHomeLayout({
+            homePath: sharedHome,
+            shadowHomePath: shadowHome,
+          });
+
+          const error = yield* materializeClaudeShadowHome(layout).pipe(Effect.flip);
+
+          expect(error).toBeInstanceOf(ClaudeShadowHomePathConflictError);
+          yield* expectSharedHomeUntouched(sharedHome);
+        }),
+    );
+
+    it.effect("rejects a shadow home that names the shared home in another letter case", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.realPath(yield* makeTempDir("t3code-claude-case-"));
+        const sharedHome = yield* makeUsedSharedHome(root);
+        const shadowHome = path.join(root, "CLAUDE");
+        // Only a case-insensitive filesystem (macOS and Windows by default)
+        // makes the two names one directory.
+        if (!(yield* fileSystem.exists(shadowHome))) return;
+        const layout = yield* resolveClaudeHomeLayout({
+          homePath: sharedHome,
+          shadowHomePath: shadowHome,
+        });
+
+        const error = yield* materializeClaudeShadowHome(layout).pipe(Effect.flip);
+
+        expect(error).toBeInstanceOf(ClaudeShadowHomePathConflictError);
+        yield* expectSharedHomeUntouched(sharedHome);
       }),
     );
 
