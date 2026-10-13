@@ -16,12 +16,14 @@ const state = vi.hoisted(() => ({
   providers: [] as ServerProvider[],
   scopeKind: "all" as "all" | "environment" | "project",
   connectedEnvironmentCount: 1,
+  canWriteSettings: true,
   updateSettings: vi.fn<(patch: ScopedSettingsPatch) => void>(),
 }));
 
 vi.mock("./useScopedSettings", () => ({
   useScopedSettings: () => state.settings,
   useUpdateScopedSettings: () => state.updateSettings,
+  useScopedSettingsWriteAllowed: () => state.canWriteSettings,
 }));
 vi.mock("./SettingsScopeContext", () => ({
   useSettingsScope: () => ({
@@ -158,6 +160,7 @@ beforeEach(() => {
   ];
   state.scopeKind = "all";
   state.connectedEnvironmentCount = 1;
+  state.canWriteSettings = true;
   state.updateSettings.mockReset();
 });
 
@@ -304,6 +307,17 @@ describe("UsageLimitFailoverSettings", () => {
     expect(root().findByProps({ "data-status": "" }).children.join("")).toContain(
       "Select an environment",
     );
+  });
+
+  it("is read-only without permission to change the environment's settings", () => {
+    state.canWriteSettings = false;
+    givenSettings({ enabled: true, chain: [{ instanceId: claudePersonal }] });
+    render();
+
+    expect(button("Continue on another account")?.props.disabled).toBe(true);
+    expect(button("Remove Claude Personal")?.props.disabled).toBe(true);
+    expect(button("Move Claude Personal up")?.props.disabled).toBe(true);
+    expect(selects().every((select) => select.props.disabled)).toBe(true);
   });
 
   it("is read-only at a project scope", () => {

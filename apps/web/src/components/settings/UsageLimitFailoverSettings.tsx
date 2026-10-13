@@ -23,7 +23,11 @@ import {
   removeEntry,
   setEntryModel,
 } from "./usageLimitFailoverChain";
-import { useScopedSettings, useUpdateScopedSettings } from "./useScopedSettings";
+import {
+  useScopedSettings,
+  useScopedSettingsWriteAllowed,
+  useUpdateScopedSettings,
+} from "./useScopedSettings";
 
 /**
  * `Select` values are strings, so "no pinned model" needs one. It cannot be
@@ -249,11 +253,14 @@ type UsageLimitFailover = UnifiedSettings["usageLimitFailover"];
 export function UsageLimitFailoverSettings() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
+  const canWriteSettings = useScopedSettingsWriteAllowed();
   const { scope, environment, connectedEnvironments } = useSettingsScope();
 
   const failover = settings.usageLimitFailover;
   const singleEnvironment = connectedEnvironments.length === 1;
-  const editable = singleEnvironment && (scope.kind === "all" || scope.kind === "environment");
+  const scopeEditable = singleEnvironment && (scope.kind === "all" || scope.kind === "environment");
+  // The row makes the switch inert without write permission, but not the list under it.
+  const editable = scopeEditable && canWriteSettings;
   // Always the whole object: a patch with only `enabled` decodes the chain as
   // empty on the server and wipes it.
   const save = (next: UsageLimitFailover) => updateSettings({ usageLimitFailover: next });
@@ -273,7 +280,7 @@ export function UsageLimitFailoverSettings() {
       description="When a usage limit stops a thread, continue it on the next account in this list. New threads skip an account that is out of quota."
       settingKeys={["usageLimitFailover"]}
       status={
-        connectedEnvironments.length > 0 && !editable
+        connectedEnvironments.length > 0 && !scopeEditable
           ? "Accounts belong to one environment. Select an environment to change this."
           : undefined
       }
