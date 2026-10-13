@@ -121,6 +121,30 @@ or endpoint configurations do not report subscription limits.
 API-key accounts may not report subscription limits. This also applies to Claude connections
 using a proxy through `ANTHROPIC_AUTH_TOKEN`.
 
+## Continue on another account
+
+When a usage limit stops a thread, T3 Code can continue it on the next account in a list you
+choose, so work keeps going while one subscription is out. In **Settings → General**, turn on
+**Continue on another account** next to **Auto-resume limited threads**, then add accounts in the
+order to try them. Each account keeps the thread's model unless you pick one for it. Accounts can
+belong to different providers, so a Claude thread can continue on Codex. The thread shows which
+account it moved from and to.
+
+New threads use the same list. If the account you choose is in it and is out of quota, the thread
+starts on the next account that has quota.
+
+Accounts belong to an environment, so with several environments connected, select one before you
+edit its list. An account you removed or disabled is skipped and shows as **Missing account** or
+**Disabled** until you take it off the list. If every account in the list is out of quota, the
+thread stays limited and **Resume at reset** works as before.
+
+Only runs limited in the last 24 hours continue this way, so turning the setting on does not
+restart old limited threads. Switching between Claude accounts that share a home keeps the whole
+session; see [Several Claude accounts, one history](./providers-claude.md#several-claude-accounts-one-history).
+Any other switch transfers the conversation's context, as described in
+[portable handoffs](./portable-handoffs.md). The mobile app follows this setting but cannot
+change it; edit it on web or desktop.
+
 ## Connect a CLIProxyAPI hub
 
 To see pooled accounts, open **Settings → Providers → Usage providers → Add hub**. Choose the

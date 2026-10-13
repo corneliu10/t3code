@@ -466,6 +466,16 @@ describe("settings search targets", () => {
     }
   });
 
+  it("finds the usage-limit failover chain and keeps it out of project scopes", () => {
+    for (const query of ["another account", "failover", "out of quota", "usage limit"]) {
+      expect(searchSettings(query).map((item) => item.id)).toContain("usage-limit-failover");
+    }
+    const failover = getSettingsSearchTargetScope("usage-limit-failover")!;
+    expect(failover.title).toBe("Continue on another account");
+    expect(isSettingsSearchScopeAvailable(failover.scope, "environment")).toBe(true);
+    expect(isSettingsSearchScopeAvailable(failover.scope, "project")).toBe(false);
+  });
+
   it("keeps environment-wide settings out of project scopes", () => {
     const updates = getSettingsSearchTargetScope("provider-update-checks")!;
     expect(updates.scope).toBe("environment-defaults");

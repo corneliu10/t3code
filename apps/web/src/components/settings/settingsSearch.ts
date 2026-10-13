@@ -356,6 +356,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["usage quota rate limit reset recover continue"],
   },
   {
+    id: "usage-limit-failover",
+    title: "Continue on another account",
+    to: "/settings/general",
+    scope: "environment-defaults",
+    searchTerms: [
+      "usage quota rate limit failover fallback switch backup account provider chain out of quota",
+    ],
+  },
+  {
     id: "working-shelf",
     title: "Working section (beta)",
     to: "/settings/general",

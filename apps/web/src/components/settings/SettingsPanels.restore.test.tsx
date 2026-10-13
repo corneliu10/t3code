@@ -1,4 +1,8 @@
-import { DEFAULT_UNIFIED_SETTINGS, type UnifiedSettings } from "@t3tools/contracts";
+import {
+  DEFAULT_UNIFIED_SETTINGS,
+  ProviderInstanceId,
+  type UnifiedSettings,
+} from "@t3tools/contracts";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { reactHookHarness as hooks } from "../../test/reactHookHarness";
@@ -76,6 +80,38 @@ describe("restoring V2 settings", () => {
     expect(state.confirm.mock.calls[0]?.[0]).toContain(label);
     expect(state.update).toHaveBeenCalledOnce();
     expect(state.update.mock.calls[0]?.[0][key]).toBe(DEFAULT_UNIFIED_SETTINGS[key]);
+  });
+
+  it("restores the usage-limit failover chain, whole, when only it changed", async () => {
+    state.settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      usageLimitFailover: {
+        enabled: false,
+        chain: [{ instanceId: ProviderInstanceId.make("claude_personal") }],
+      },
+    };
+    hooks.beginRender();
+    const restore = useSettingsRestore();
+
+    expect(restore.changedSettingLabels).toEqual(["Continue on another account"]);
+    await restore.restoreDefaults();
+
+    expect(state.update).toHaveBeenCalledOnce();
+    expect(state.update.mock.calls[0]?.[0].usageLimitFailover).toEqual({
+      enabled: false,
+      chain: [],
+    });
+  });
+
+  it("does not list the failover setting as changed when a server sends the default again", () => {
+    // Settings arrive decoded per environment, so the default is never the same object.
+    state.settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      usageLimitFailover: { enabled: false, chain: [] },
+    };
+    hooks.beginRender();
+
+    expect(useSettingsRestore().changedSettingLabels).toEqual([]);
   });
 
   it("does not reset settings after cancellation", async () => {
